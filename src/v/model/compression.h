@@ -1,0 +1,85 @@
+/*
+ * Copyright 2020 Redpanda Data, Inc.
+ *
+ * Use of this software is governed by the Business Source License
+ * included in the file licenses/BSL.md
+ *
+ * As of the Change Date specified in that file, in accordance with
+ * the Business Source License, use of this software will be governed
+ * by the Apache License, Version 2.0
+ */
+
+#pragma once
+
+#include "base/format_to.h"
+
+#include <array>
+#include <cstdint>
+#include <iosfwd>
+#include <limits>
+#include <string_view>
+#include <type_traits>
+
+namespace model {
+
+/*
+ * This enum serves three purposes:
+ *
+ * 1. It is used represent batch compression types (eg none, lz4)
+ * 2. It is used represent compression policies (eg producer)
+ *
+ * And (3) the enum values for batch compression types must be identical to
+ * those values used in the encoding of kafka batch attributes.
+ *
+ *    https://kafka.apache.org/documentation/#compression.type
+ *
+ * Compression types like `producer` have values outside the range of values
+ * used in any wire encoded representation and are only used internally.
+ */
+enum class compression : uint8_t {
+    none = 0,
+    gzip = 1,
+    // NOTE: This is *NOT* standard snappy compression. It uses the java-snappy
+    // framing compression which is fundamentally not compatible with upstream
+    // google snappy
+    snappy = 2,
+    lz4 = 3,
+    zstd = 4,
+
+    // the number of batch compression types (put new types above this)
+    count,
+
+    // values below must not intersect with the value range used to encode
+    // compression codecs in kafka batch attributes.
+    producer = std::numeric_limits<std::underlying_type_t<compression>>::max()
+};
+
+constexpr auto all_batch_compression_types = [] {
+    std::array<compression, static_cast<size_t>(compression::count)> types{};
+    for (int c = 0; c < static_cast<int>(compression::count); ++c) {
+        types[c] = static_cast<compression>(c);
+    }
+    return types;
+}();
+
+inline fmt::iterator format_to(compression c, fmt::iterator out) {
+    switch (c) {
+    case compression::none:
+        return fmt::format_to(out, "none");
+    case compression::gzip:
+        return fmt::format_to(out, "gzip");
+    case compression::snappy:
+        return fmt::format_to(out, "snappy");
+    case compression::lz4:
+        return fmt::format_to(out, "lz4");
+    case compression::zstd:
+        return fmt::format_to(out, "zstd");
+    case compression::producer:
+        return fmt::format_to(out, "producer");
+    default:
+        return fmt::format_to(out, "ERROR");
+    }
+}
+std::istream& operator>>(std::istream&, compression&);
+
+} // namespace model

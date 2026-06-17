@@ -1,0 +1,27 @@
+area/k8s:
+- changed-files:
+  - any-glob-to-any-file: ['src/go/k8s/**/*']
+
+k8s/tests:
+- changed-files:
+  - any-glob-to-any-file: ['src/go/k8s/**/*']
+
+area/build:
+- changed-files:
+  - any-glob-to-any-file: ['cmake/**/*', '.github/**/*', 'bazel/**/*', 'MODULE.bazel', '**/BUILD', '**/*.bzl']
+
+area/docs:
+- changed-files:
+  - any-glob-to-any-file: ['docs/**/*']
+
+area/rpk:
+- changed-files:
+  - any-glob-to-any-file: ['src/go/rpk/**/*']
+
+area/redpanda:
+- changed-files:
+  - any-glob-to-any-file: ['src/v/**/*']
+
+area/wasm:
+- changed-files:
+  - any-glob-to-any-file: ['src/transform-sdk/**/*', 'src/v/transform/**/*', 'src/v/wasm/**/*']

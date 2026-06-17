@@ -1,0 +1,7 @@
+**
+!docker/ssh
+!docker/ssh-config
+!setup.py
+!protobuf
+!local_venv.sh
+!type-checking

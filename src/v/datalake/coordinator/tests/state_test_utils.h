@@ -1,0 +1,108 @@
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
+#pragma once
+
+#include "container/chunked_vector.h"
+#include "datalake/coordinator/file_committer.h"
+#include "datalake/coordinator/state.h"
+#include "datalake/coordinator/translated_offset_range.h"
+#include "model/fundamental.h"
+
+#include <seastar/core/coroutine.hh>
+
+#include <gtest/gtest.h>
+
+#include <vector>
+
+namespace datalake::coordinator {
+
+// Simple committer that returns the set of updates that would mark all the
+// pending files as committed. Doesn't affect any external state.
+class simple_file_committer : public file_committer {
+public:
+    ss::future<checked<chunked_vector<mark_files_committed_update>, errc>>
+    commit_topic_files_to_catalog(
+      model::topic t, const topics_state& state) const override {
+        chunked_vector<mark_files_committed_update> ret;
+        auto t_iter = std::ranges::find(
+          state.topic_to_state,
+          t,
+          &std::pair<model::topic, topic_state>::first);
+        if (t_iter == state.topic_to_state.end()) {
+            co_return ret;
+        }
+        // Mark the last file in each partition as committed.
+        auto& t_state = t_iter->second;
+        for (const auto& [pid, files] : t_state.pid_to_pending_files) {
+            if (files.pending_entries.empty()) {
+                continue;
+            }
+            model::topic_partition tp(t, pid);
+            auto build_res = mark_files_committed_update::build(
+              state,
+              tp,
+              t_state.revision,
+              files.pending_entries.back().data.last_offset,
+              files.pending_entries.back().data.kafka_bytes_processed);
+            EXPECT_FALSE(build_res.has_error());
+            ret.emplace_back(std::move(build_res.value()));
+        }
+        co_return ret;
+    }
+
+    ss::future<checked<std::nullopt_t, errc>>
+    drop_table(const iceberg::table_identifier&, purge_data) const final {
+        co_return std::nullopt;
+    }
+
+    ~simple_file_committer() override = default;
+};
+
+// Utility methods for generating and operating on coordinator state.
+
+// Returns file entries corresponding to the given offset ranges.
+//
+// If with_file is true, the range will contain a data file, which may be
+// useful when callers need more than just offset bounds (e.g. to test file
+// deduplication).
+//
+// If dlq is true, all files will be marked as DLQ files.
+chunked_vector<translated_offset_range> make_pending_files(
+  const std::vector<std::pair<int64_t, int64_t>>& offset_bounds,
+  bool with_file = false,
+  bool dlq = false);
+
+// Adds the given partition-id-indexed pairs of offsets as pending files to
+// `state`, with the files being added at the given coordinator offset.
+using pairs_t = std::vector<std::pair<int64_t, int64_t>>;
+void add_partition_state(
+  std::vector<pairs_t> offset_bounds_by_pid,
+  topic_state& state,
+  model::offset added_at,
+  bool with_files,
+  bool dlq = false);
+
+// Creates topic state with the given partition-id-indexed pairs of offsets as
+// pending files to `state`, with the files being added at the given
+// coordinator offset.
+topic_state make_topic_state(
+  std::vector<pairs_t> offset_bounds_by_pid,
+  model::offset added_at = model::offset{1000},
+  bool with_files = false,
+  bool dlq = false);
+
+// Asserts that the given state has the expected partition state.
+void check_partition(
+  const topics_state& state,
+  const model::topic_partition& tp,
+  std::optional<int64_t> expected_committed,
+  const pairs_t& offset_bounds);
+
+} // namespace datalake::coordinator

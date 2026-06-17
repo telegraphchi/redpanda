@@ -1,0 +1,109 @@
+/*
+ * Copyright 2021 Redpanda Data, Inc.
+ *
+ * Use of this software is governed by the Business Source License
+ * included in the file licenses/BSL.md
+ *
+ * As of the Change Date specified in that file, in accordance with
+ * the Business Source License, use of this software will be governed
+ * by the Apache License, Version 2.0
+ */
+#include "kafka/server/handlers/describe_acls.h"
+
+#include "cluster/security_frontend.h"
+#include "kafka/protocol/errors.h"
+#include "kafka/server/handlers/details/security.h"
+#include "kafka/server/request_context.h"
+#include "kafka/server/response.h"
+
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/smp.hh>
+#include <seastar/util/log.hh>
+
+namespace kafka {
+
+static void fill_response(
+  request_context& ctx,
+  security::acl_binding_filter& filter,
+  describe_acls_response_data& response,
+  bool describing_registry_resource) {
+    /*
+     * collapse common acls by pattern
+     */
+    absl::flat_hash_map<
+      security::resource_pattern,
+      chunked_vector<security::acl_entry>>
+      entries;
+
+    auto bindings = ctx.authorizer().acls(filter);
+
+    for (const auto& binding : bindings) {
+        entries[binding.pattern()].push_back(binding.entry());
+    }
+
+    for (auto& entry : entries) {
+        response.resources.push_back(
+          kafka::details::acl_entry_to_resource(
+            entry.first,
+            std::move(entry.second),
+            describing_registry_resource));
+    }
+}
+
+template<>
+ss::future<response_ptr> describe_acls_handler::handle(
+  request_context ctx, [[maybe_unused]] ss::smp_service_group ssg) {
+    describe_acls_request request;
+    request.decode(ctx.reader(), ctx.header().version);
+    log_request(ctx.header(), request);
+
+    auto authz = ctx.authorized(
+      security::acl_operation::describe, security::default_cluster_name);
+
+    if (!ctx.audit()) {
+        describe_acls_response resp;
+        resp.data.error_code = error_code::broker_not_available;
+        resp.data.error_message = "Broker not available - audit system failure";
+
+        co_return co_await ctx.respond(std::move(resp));
+    }
+
+    if (!authz) {
+        describe_acls_response resp;
+        resp.data.error_code = error_code::cluster_authorization_failed;
+        co_return co_await ctx.respond(std::move(resp));
+    }
+
+    /// To prevent stale responses in the case this node is not the controller
+    /// leader, wait until it catches up with the current controller leaders
+    /// current last_applied offset of the controller log
+    static const auto catchup_timeout = 5s;
+    const auto error_code = co_await ctx.security_frontend()
+                              .wait_until_caughtup_with_leader(catchup_timeout);
+    if (error_code) {
+        vlog(
+          klog.info,
+          "Failed waiting on catchup with controller leader before handling "
+          "describeACLs request (reason: {}), stale results may be returned",
+          error_code);
+    }
+
+    describe_acls_response_data data;
+
+    try {
+        auto filter = details::to_acl_binding_filter(request.data);
+        fill_response(ctx, filter, data, request.data.describe_registry_acls);
+    } catch (const details::acl_conversion_error& e) {
+        vlog(klog.debug, "Error describing ACLs: {}", e.what());
+        data.error_code = error_code::invalid_request;
+        data.error_message = e.what();
+    }
+
+    describe_acls_response response{
+      .data = std::move(data),
+    };
+
+    co_return co_await ctx.respond(std::move(response));
+}
+
+} // namespace kafka

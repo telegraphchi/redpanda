@@ -1,0 +1,168 @@
+load("//bazel:build.bzl", "redpanda_cc_library")
+
+package(
+    default_visibility = ["//src/v/serde/parquet:__subpackages__"],
+)
+
+redpanda_cc_library(
+    name = "schema",
+    srcs = [
+        "flattened_schema.cc",
+        "schema.cc",
+    ],
+    hdrs = [
+        "flattened_schema.h",
+        "schema.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/base",
+        "//src/v/container:chunked_vector",
+        "//src/v/utils:named_type",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "metadata",
+    srcs = [
+        "metadata.cc",
+    ],
+    hdrs = [
+        "metadata.h",
+    ],
+    deps = [
+        ":schema",
+        "//src/v/base",
+        "//src/v/bytes:iobuf",
+        "//src/v/container:chunked_vector",
+        "//src/v/hashing:crc32",
+        "//src/v/serde/thrift:compact",
+        "//src/v/utils:vint",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "value",
+    srcs = [
+        "value.cc",
+    ],
+    hdrs = [
+        "value.h",
+    ],
+    implementation_deps = [
+        "@abseil-cpp//absl/strings",
+        "@seastar",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/base",
+        "//src/v/bytes:iobuf",
+        "//src/v/container:chunked_vector",
+    ],
+)
+
+redpanda_cc_library(
+    name = "encoding",
+    srcs = [
+        "encoding.cc",
+    ],
+    hdrs = [
+        "encoding.h",
+    ],
+    deps = [
+        ":schema",
+        ":value",
+        "//src/v/base",
+        "//src/v/bytes:iobuf",
+        "//src/v/container:chunked_vector",
+        "//src/v/utils:vint",
+    ],
+)
+
+redpanda_cc_library(
+    name = "shredder",
+    srcs = [
+        "shredder.cc",
+    ],
+    hdrs = [
+        "shredder.h",
+    ],
+    deps = [
+        ":schema",
+        ":value",
+        "//src/v/base",
+        "@abseil-cpp//absl/functional:function_ref",
+        "@boost//:range",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "bloom_filter",
+    srcs = ["bloom_filter.cc"],
+    hdrs = ["bloom_filter.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/bytes:iobuf",
+        "//src/v/serde/thrift:compact",
+        "//src/v/utils:vint",
+    ],
+)
+
+redpanda_cc_library(
+    name = "column_writer",
+    srcs = [
+        "column_stats_collector.cc",
+        "column_writer.cc",
+    ],
+    hdrs = [
+        "column_stats_collector.h",
+        "column_writer.h",
+    ],
+    deps = [
+        ":bloom_filter",
+        ":encoding",
+        ":metadata",
+        ":schema",
+        ":value",
+        "//src/v/base",
+        "//src/v/bytes:iobuf",
+        "//src/v/bytes:iobuf_parser",
+        "//src/v/compression",
+        "//src/v/container:chunked_vector",
+        "//src/v/hashing:crc32",
+        "//src/v/hashing:xx",
+        "//src/v/strings:utf8",
+        "@abseil-cpp//absl/numeric:int128",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "writer",
+    srcs = [
+        "writer.cc",
+    ],
+    hdrs = [
+        "writer.h",
+    ],
+    implementation_deps = [
+        ":column_writer",
+        ":shredder",
+        "//src/v/bytes:iobuf",
+        "//src/v/bytes:iostream",
+        "//src/v/container:contiguous_range_map",
+        "@abseil-cpp//absl/container:flat_hash_set",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":metadata",
+        ":schema",
+        ":value",
+        "//src/v/base",
+        "//src/v/container:chunked_vector",
+        "@seastar",
+    ],
+)

@@ -1,0 +1,128 @@
+/*
+ * Copyright 2022 Redpanda Data, Inc.
+ *
+ * Use of this software is governed by the Business Source License
+ * included in the file licenses/BSL.md
+ *
+ * As of the Change Date specified in that file, in accordance with
+ * the Business Source License, use of this software will be governed
+ * by the Apache License, Version 2.0
+ */
+
+#pragma once
+#include "base/seastarx.h"
+#include "serde/rw/chrono.h"
+#include "serde/rw/enum.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/named_type.h"
+#include "serde/rw/scalar.h"
+#include "serde/rw/sstring.h"
+
+#include <seastar/core/sstring.hh>
+
+#include <fmt/core.h>
+
+#include <chrono>
+#include <exception>
+
+namespace security {
+
+class license_exception : public std::exception {
+public:
+    explicit license_exception(ss::sstring s) noexcept
+      : _msg(std::move(s)) {}
+
+    const char* what() const noexcept override { return _msg.c_str(); }
+
+private:
+    ss::sstring _msg;
+};
+
+class license_invalid_exception final : public license_exception {
+public:
+    explicit license_invalid_exception(ss::sstring s) noexcept
+      : license_exception(std::move(s)) {}
+};
+
+class license_malformed_exception final : public license_exception {
+public:
+    explicit license_malformed_exception(ss::sstring s) noexcept
+      : license_exception(std::move(s)) {}
+};
+
+class license_verifcation_exception final : public license_exception {
+public:
+    explicit license_verifcation_exception(ss::sstring s) noexcept
+      : license_exception(std::move(s)) {}
+};
+
+enum class license_type : uint8_t { free_trial = 0, enterprise = 1 };
+
+struct license
+  : serde::envelope<license, serde::version<2>, serde::compat_version<0>> {
+    using clock = std::chrono::system_clock;
+
+    /// Expected encoded contents
+    uint8_t format_version;
+    // This variable should not be used directly. Use get_type accessor, instead
+    license_type _type;
+    ss::sstring organization;
+    std::chrono::seconds expiry;
+    ss::sstring checksum;
+    // This variable should not be used directly. Use get_type accessor, instead
+    ss::sstring _type_str;
+    std::vector<ss::sstring> products;
+
+    ss::sstring get_type() const;
+
+    auto serde_fields() {
+        return std::tie(
+          format_version,
+          _type,
+          organization,
+          expiry,
+          checksum,
+          _type_str,
+          products);
+    }
+
+    /// true if todays date is greater then \ref expiry
+    bool is_expired() const noexcept;
+
+    /// Seconds since epoch until license expiration
+    std::chrono::seconds expires() const noexcept;
+
+    /// Expiration timepoint
+    clock::time_point expiration() const noexcept;
+
+    auto operator<=>(const license&) const = delete;
+
+private:
+    friend struct fmt::formatter<license>;
+
+    friend bool operator==(const license& a, const license& b) = default;
+};
+
+/// Returns a license or an exception indicating the reason why the method
+/// failed, reasons could be:
+/// 1. Malformed license
+/// 2. Invalid license
+license make_license(std::string_view raw_license);
+
+} // namespace security
+
+namespace fmt {
+template<>
+struct formatter<security::license> {
+    using type = security::license;
+
+    constexpr auto parse(format_parse_context& ctx) const {
+        return ctx.begin();
+    }
+
+    template<typename FormatContext>
+    typename FormatContext::iterator
+    format(const type& r, FormatContext& ctx) const;
+};
+
+} // namespace fmt

@@ -1,0 +1,15 @@
+# TODO work in progress getting clustered mode issues worked out
+gcp:
+  included:
+    - tests
+    - transactions
+    - tuner_integration_tests/net_tuner_test.py::GcpNetTunerTest
+    - scale_tests/cloud_topics_compaction_scale_test.py
+    - scale_tests/many_partitions_test.py::ManyPartitionsTest.test_many_partitions_cloud_topics
+    - scale_tests/many_partitions_test.py::ManyPartitionsTest.test_many_partitions_cloud_topics_tiered_storage
+    - scale_tests/large_messages_test.py::LargeMessagesTest.test_cloud_topics_large_messages_throughput
+
+  excluded:
+    - tests/librdkafka_test.py # normally disabled
+    - tests/e2e_iam_role_test.py # use static credentials
+    - tests/consumer_group_recovery_tool_test.py # use script available in dockerfile

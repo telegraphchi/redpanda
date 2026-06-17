@@ -1,0 +1,815 @@
+// Copyright 2022 Redpanda Data, Inc.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.md
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0
+
+//go:build linux
+
+package bundle
+
+import (
+	"archive/zip"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	adminv2 "buf.build/gen/go/redpandadata/core/protocolbuffers/go/redpanda/core/admin/v2"
+	"connectrpc.com/connect"
+	"github.com/hashicorp/go-multierror"
+	"github.com/redpanda-data/common-go/rpadmin"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/adminapi"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/debug/debugbundle"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/config"
+	"github.com/spf13/afero"
+	"go.uber.org/zap"
+	authorizationv1 "k8s.io/api/authorization/v1"
+	k8score "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+)
+
+func executeK8SBundle(ctx context.Context, bp bundleParams) error {
+	fmt.Println("Creating bundle file...")
+	mode := os.FileMode(0o755)
+	f, err := bp.fs.OpenFile(
+		bp.path,
+		os.O_CREATE|os.O_WRONLY,
+		mode,
+	)
+	if err != nil {
+		return fmt.Errorf("unable to create bundle file: %v", err)
+	}
+	defer f.Close()
+
+	var grp multierror.Group
+
+	w := zip.NewWriter(f)
+	defer w.Close()
+
+	ps := &stepParams{
+		fs:        bp.fs,
+		w:         w,
+		timeout:   bp.timeout,
+		fileRoot:  strings.TrimSuffix(filepath.Base(bp.path), ".zip"),
+		sharedBuf: make([]byte, 32*1024),
+	}
+	var errs *multierror.Error
+	bp.namespace = resolveNamespace(bp.namespace)
+	steps := []step{
+		saveCPUInfo(ps),
+		saveCmdLine(ps),
+		saveConfig(ps, bp.yActual),
+		saveControllerLogDir(ps, bp.y, bp.controllerLogLimitBytes),
+		saveCrashReports(ps, bp.y),
+		saveDataDirStructure(ps, bp.y),
+		saveDf(ctx, ps),
+		saveDiskUsage(ctx, ps, bp.y),
+		saveProcFileSampled(ctx, ps, "/proc/diskstats", "diskstats", bp.metricsInterval, bp.metricsSampleCount),
+		saveProcFileSampled(ctx, ps, "/proc/interrupts", "interrupts", bp.metricsInterval, bp.metricsSampleCount),
+		saveKafkaMetadata(ctx, ps, bp.cl),
+		saveKernelSymbols(ps),
+		saveLsblk(ctx, ps),
+		saveMdstat(ps),
+		saveMountedFilesystems(ps),
+		saveNTPDrift(ps),
+		saveResourceUsageData(ps, bp.y),
+		saveStartupLog(ps, bp.y),
+		saveSlabInfo(ps),
+		saveProcFileSampled(ctx, ps, "/proc/softirqs", "softirqs", bp.metricsInterval, bp.metricsSampleCount),
+		saveUname(ctx, ps),
+	}
+
+	// We use the K8S to discover the cluster's admin API addresses and collect
+	// logs and k8s resources. First we check if we have enough permissions
+	// before kicking the steps.
+	var adminAddresses []string
+	if err := checkK8sPermissions(ctx, bp.namespace); err != nil {
+		errs = multierror.Append(
+			errs,
+			fmt.Errorf("skipping log collection and Kubernetes resource collection (such as Pods and Services) in the namespace %q: %v. To enable this, grant additional permissions to your Service Account. For more information, visit https://docs.redpanda.com/current/manage/kubernetes/troubleshooting/k-diagnostics-bundle/", bp.namespace, err),
+		)
+	} else {
+		steps = append(steps, []step{
+			saveK8SResources(ctx, ps, bp.namespace, bp.labelSelector),
+			saveK8SLogs(ctx, ps, bp.namespace, bp.logsSince, bp.logsLimitBytes, bp.labelSelector),
+		}...)
+
+		adminAddresses, err = adminAddressesFromK8S(ctx, bp.namespace)
+		if err != nil {
+			zap.L().Sugar().Warnf("unable to get admin API addresses from the k8s API: %v", err)
+		}
+	}
+	// It's always safe to use the admin API addresses from the profile, even if
+	// we already have the addresses from the k8s API.
+	if len(bp.p.AdminAPI.Addresses) > 0 {
+		adminAddresses = adminAddressesUnion(bp.p.AdminAPI.Addresses, adminAddresses)
+	} else {
+		zap.L().Sugar().Warnf("no admin API addresses found in the current rpk profile")
+	}
+	if len(adminAddresses) == 0 {
+		defaultAddress := fmt.Sprintf("127.0.0.1:%v", config.DefaultAdminPort)
+		adminAddresses = []string{defaultAddress}
+	}
+	zap.L().Debug("using admin API addresses", zap.Strings("addresses", adminAddresses))
+	steps = append(steps, []step{
+		saveClusterAdminAPICalls(ctx, ps, bp.fs, bp.p, adminAddresses, bp.partitions, bp.connectionLimit),
+		saveSingleAdminAPICalls(ctx, ps, bp.fs, bp.p, adminAddresses, bp.cpuProfilerWait),
+		saveMetricsAPICalls(ctx, ps, bp.fs, bp.p, adminAddresses, bp.metricsInterval, bp.metricsSampleCount),
+	}...)
+
+	for _, s := range steps {
+		grp.Go(s)
+	}
+
+	stepErrs := grp.Wait()
+	if stepErrs != nil || errs != nil {
+		errs = multierror.Append(errs, stepErrs.ErrorOrNil())
+		err := writeFileToZip(ps, "errors.txt", []byte(errs.Error()))
+		if err != nil {
+			errs = multierror.Append(errs, err)
+		}
+		errs.ErrorFormat = errorFormat
+		fmt.Println(errs.Error())
+	}
+
+	fmt.Printf("Debug bundle saved to %q\n", f.Name())
+	return nil
+}
+
+// adminAddressesUnion returns the union of two slices of admin addresses,
+// treating two entries as the same broker iff they share the same leftmost
+// DNS label of the host portion and the same port. This collapses pairs like
+//
+//	"cluster-third-0.default:9644"                                   (rpk profile, short form)
+//	"cluster-third-0.cluster.default.svc.cluster.local.:9644"        (K8s discovery, FQDN)
+//
+// which the previous implementation treated as distinct strings, causing the
+// local broker to be queried twice (once per host form) when the rpk profile
+// and the K8s discovery disagree on the DNS suffix — common in setups where
+// the operator renders short-form addresses but rpk reconstructs FQDNs from a
+// headless Service. IP literals are not collapsed: only the leftmost label of
+// non-IP hostnames is used as the dedup key.
+//
+// Order is preserved; the first occurrence of each broker wins.
+func adminAddressesUnion(a, b []string) []string {
+	seen := make(map[string]struct{}, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, addr := range a {
+		appendUnique(addr, seen, &out)
+	}
+	for _, addr := range b {
+		appendUnique(addr, seen, &out)
+	}
+	return out
+}
+
+func appendUnique(addr string, seen map[string]struct{}, out *[]string) {
+	key := adminAddressKey(addr)
+	if _, ok := seen[key]; ok {
+		return
+	}
+	seen[key] = struct{}{}
+	*out = append(*out, addr)
+}
+
+// adminAddressKey returns a canonical key used to detect that two admin
+// address strings refer to the same broker. The key is the leftmost label of
+// the host portion (stripped of any trailing dot) plus the port. For IP
+// literals the full address is used so different hosts in the same subnet
+// don't collapse. If the input isn't a valid host:port, the original string
+// is returned so behavior degrades to exact-string equality.
+func adminAddressKey(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	host = strings.TrimSuffix(host, ".")
+	if net.ParseIP(host) != nil {
+		return host + ":" + port
+	}
+	if i := strings.IndexByte(host, '.'); i >= 0 {
+		host = host[:i]
+	}
+	return host + ":" + port
+}
+
+func k8sClientset() (*kubernetes.Clientset, error) {
+	k8sCfg, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("unable to get kubernetes cluster configuration: %v", err)
+	}
+	// We need to increase the burst size to avoid throttling. We do ~6-8 req
+	// per broker.
+	k8sCfg.Burst = 30
+
+	return kubernetes.NewForConfig(k8sCfg)
+}
+
+// k8sPodList will create a clientset using the config object which uses the
+// service account kubernetes gives to pods (InClusterConfig) and the list of
+// pods in the given namespace.
+func k8sPodList(ctx context.Context, namespace string, labelSelector map[string]string) (*kubernetes.Clientset, *k8score.PodList, error) {
+	clientset, err := k8sClientset()
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to create kubernetes client: %v", err)
+	}
+
+	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.Set(labelSelector).String(),
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to get pods in the %q namespace: %v", namespace, err)
+	}
+	return clientset, pods, nil
+}
+
+// checkK8sPermissions will check for the minimal service account permissions
+// needed to perform the k8s-API-related steps in the debug bundle collection
+// process.
+func checkK8sPermissions(ctx context.Context, namespace string) error {
+	cl, err := k8sClientset()
+	if err != nil {
+		return fmt.Errorf("unable to create kubernetes client: %v", err)
+	}
+
+	// These are the minimal permissions needed for the k8s bundle to function.
+	perMap := map[string]string{
+		"services": "list",
+		"pods":     "list",
+	}
+	for resource, verb := range perMap {
+		sar := &authorizationv1.SelfSubjectAccessReview{
+			Spec: authorizationv1.SelfSubjectAccessReviewSpec{
+				ResourceAttributes: &authorizationv1.ResourceAttributes{
+					Namespace: namespace,
+					Verb:      verb,
+					Resource:  resource,
+				},
+			},
+		}
+		response, err := cl.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, sar, metav1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("unable to check service account permissions: %v", err)
+		}
+		if !response.Status.Allowed {
+			return fmt.Errorf("permission denied to %s %s", verb, resource)
+		}
+	}
+	return nil
+}
+
+// adminAddressesFromK8S returns the admin API host:port list by querying the
+// K8S Api.
+func adminAddressesFromK8S(ctx context.Context, namespace string) ([]string, error) {
+	// This is intended to run only in a k8s cluster:
+	cl, err := k8sClientset()
+	if err != nil {
+		return nil, fmt.Errorf("unable to create kubernetes client: %v", err)
+	}
+
+	var svc k8score.Service
+	services, err := cl.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("unable to list services: %v", err)
+	}
+	// To get the service name we use the service that have None as ClusterIP
+	// this is the case in both our helm deployment and k8s operator.
+	for _, s := range services.Items {
+		if s.Spec.ClusterIP == k8score.ClusterIPNone {
+			svc = s
+			break // no need to keep looping.
+		}
+	}
+
+	// And list the pods based on the service label selector.
+	pods, err := cl.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(svc.Spec.Selector).String(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("unable to list pods in the service %q: %v", svc.Name, err)
+	}
+
+	clusterDomain := getClusterDomain(ctx)
+	// Get the admin addresses from ContainerPort.
+	var adminAddresses []string
+	for _, p := range pods.Items {
+		for _, port := range p.Spec.Containers[0].Ports {
+			if port.Name == "admin" {
+				fqdn := fmt.Sprintf("%v.%v.%v.svc.%v", p.Spec.Hostname, svc.Name, p.Namespace, clusterDomain)
+				a := fmt.Sprintf("%v:%v", fqdn, port.ContainerPort)
+				adminAddresses = append(adminAddresses, a)
+			}
+		}
+	}
+
+	if len(adminAddresses) == 0 {
+		return nil, fmt.Errorf("could not find any exposed 'admin' container port for the pods in the %q namespace", namespace)
+	}
+
+	return adminAddresses, nil
+}
+
+// getClusterDomain returns Kubernetes cluster domain, default to
+// "cluster.local.".
+func getClusterDomain(ctx context.Context) string {
+	const apiSvc = "kubernetes.default.svc"
+
+	cname, err := net.DefaultResolver.LookupCNAME(ctx, apiSvc)
+	if err != nil {
+		return "cluster.local."
+	}
+	clusterDomain := strings.TrimPrefix(cname, apiSvc+".")
+
+	return clusterDomain
+}
+
+// resolveNamespace determines the Kubernetes namespace to use based on the
+// following priority order:
+//  1. The `--namespace` flag, if provided.
+//  2. The `NAMESPACE` environment variable, if set.
+//  3. The contents of the file
+//     `/var/run/secrets/kubernetes.io/serviceaccount/namespace`, if it exists.
+//  4. A default fallback value of "redpanda".
+func resolveNamespace(ns string) string {
+	if ns != "" {
+		return ns
+	}
+	zap.L().Sugar().Warn("flag '--namespace' not set; reading from $NAMESPACE")
+	if envNamespace := os.Getenv("NAMESPACE"); envNamespace != "" {
+		return envNamespace
+	}
+	zap.L().Sugar().Warn("$NAMESPACE not set; reading /var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if data, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil {
+		return strings.TrimSpace(string(data))
+	}
+	zap.L().Sugar().Warn("could not identify namespace; using default 'redpanda'")
+	return "redpanda"
+}
+
+// saveClusterAdminAPICalls saves per-cluster Admin API requests in the 'admin/'
+// directory of the bundle zip.
+func saveClusterAdminAPICalls(ctx context.Context, ps *stepParams, fs afero.Fs, p *config.RpkProfile, adminAddresses []string, partitions []topicPartitionFilter, connectionLimit int32) step {
+	return func() error {
+		p = &config.RpkProfile{
+			KafkaAPI: config.RpkKafkaAPI{
+				SASL: p.KafkaAPI.SASL,
+			},
+			AdminAPI: config.RpkAdminAPI{
+				Addresses: adminAddresses,
+				TLS:       p.AdminAPI.TLS,
+			},
+		}
+		cl, err := adminapi.NewClient(ctx, fs, p)
+		if err != nil {
+			return fmt.Errorf("unable to initialize admin client: %v", err)
+		}
+
+		var grp multierror.Group
+		reqFuncs := []func() error{
+			func() error { return requestAndSave(ctx, ps, "admin/brokers.json", cl.Brokers) },
+			func() error { return requestAndSave(ctx, ps, "admin/broker_uuids.json", cl.GetBrokerUuids) },
+			func() error { return requestAndSave(ctx, ps, "admin/health_overview.json", cl.GetHealthOverview) },
+			func() error { return requestAndSave(ctx, ps, "admin/license.json", cl.GetLicenseInfo) },
+			func() error { return requestAndSave(ctx, ps, "admin/reconfigurations.json", cl.Reconfigurations) },
+			func() error { return requestAndSave(ctx, ps, "admin/features.json", cl.GetFeatures) },
+			func() error { return requestAndSave(ctx, ps, "admin/uuid.json", cl.ClusterUUID) },
+			func() error { return requestAndSave(ctx, ps, "admin/metrics_uuid.json", cl.MetricsUUID) },
+			func() error {
+				return requestAndSave(ctx, ps, "admin/automated_recovery.json", cl.PollAutomatedRecoveryStatus)
+			},
+			func() error {
+				return requestAndSave(ctx, ps, "admin/cloud_storage_lifecycle.json", cl.CloudStorageLifecycle)
+			},
+			func() error {
+				return requestAndSave(ctx, ps, "admin/partition_balancer_status.json", cl.GetPartitionStatus)
+			},
+			func() error {
+				// Need to wrap this function because cl.Config receives an additional 'includeDefaults' param.
+				f := func(ctx context.Context) (rpadmin.Config, error) {
+					return cl.Config(ctx, true)
+				}
+				return requestAndSave(ctx, ps, "admin/cluster_config.json", f)
+			}, func() error {
+				f := func(ctx context.Context) (rpadmin.ConfigStatusResponse, error) {
+					return cl.ClusterConfigStatus(ctx, true)
+				}
+				return requestAndSave(ctx, ps, "admin/cluster_config_status.json", f)
+			}, func() error {
+				f := func(ctx context.Context) ([]rpadmin.ClusterPartition, error) {
+					return cl.AllClusterPartitions(ctx, true, false) // include defaults, and include disabled.
+				}
+				return requestAndSave(ctx, ps, "admin/cluster_partitions.json", f)
+			},
+			func() error {
+				return requestAndSave(ctx, ps, "admin/kafka_connections.json", func(ctx context.Context) (*adminv2.ListKafkaConnectionsResponse, error) {
+					resp, err := cl.ClusterService().ListKafkaConnections(ctx, &connect.Request[adminv2.ListKafkaConnectionsRequest]{Msg: &adminv2.ListKafkaConnectionsRequest{PageSize: connectionLimit}})
+
+					if err != nil {
+						return nil, err
+					} else {
+						return resp.Msg, nil
+					}
+				})
+			},
+		}
+		if partitions != nil {
+			extraFuncs := saveExtraFuncs(ctx, ps, cl, partitions)
+			reqFuncs = append(reqFuncs, extraFuncs...)
+		}
+		for _, f := range reqFuncs {
+			grp.Go(f)
+		}
+		errs := grp.Wait()
+		return errs.ErrorOrNil()
+	}
+}
+
+// saveSingleAdminAPICalls saves per-node admin API requests in the 'admin/'
+// directory of the bundle zip.
+func saveSingleAdminAPICalls(ctx context.Context, ps *stepParams, fs afero.Fs, p *config.RpkProfile, adminAddresses []string, profilerWait time.Duration) step {
+	return func() error {
+		var rerrs *multierror.Error
+		var funcs []func() error
+		for _, a := range adminAddresses {
+			a := a
+			p = &config.RpkProfile{
+				KafkaAPI: config.RpkKafkaAPI{
+					SASL: p.KafkaAPI.SASL,
+				},
+				AdminAPI: config.RpkAdminAPI{
+					Addresses: []string{a},
+					TLS:       p.AdminAPI.TLS,
+				},
+			}
+			cl, err := adminapi.NewClient(ctx, fs, p, rpadmin.ClientTimeout(profilerWait+2*time.Second))
+			if err != nil {
+				rerrs = multierror.Append(rerrs, fmt.Errorf("unable to initialize admin client for %q: %v", a, err))
+				continue
+			}
+
+			aName := debugbundle.SanitizeName(a)
+			r := []func() error{
+				func() error {
+					return requestAndSave(ctx, ps, fmt.Sprintf("admin/node_config_%v.json", aName), cl.RawNodeConfig)
+				},
+				func() error {
+					return requestAndSave(ctx, ps, fmt.Sprintf("admin/cluster_view_%v.json", aName), cl.ClusterView)
+				},
+				func() error {
+					return requestAndSave(ctx, ps, fmt.Sprintf("admin/maintenance_status_%v.json", aName), cl.MaintenanceStatus)
+				},
+				func() error {
+					return requestAndSave(ctx, ps, fmt.Sprintf("admin/raft_status_%v.json", aName), cl.RaftRecoveryStatus)
+				},
+				func() error {
+					return requestAndSave(ctx, ps, fmt.Sprintf("admin/partition_leader_table_%v.json", aName), cl.PartitionLeaderTable)
+				},
+				func() error {
+					return requestAndSave(ctx, ps, fmt.Sprintf("admin/is_node_isolated_%v.json", aName), cl.IsNodeIsolated)
+				},
+				func() error {
+					return requestAndSave(ctx, ps, fmt.Sprintf("admin/controller_status_%v.json", aName), cl.ControllerStatus)
+				},
+				func() error {
+					return requestAndSave(ctx, ps, fmt.Sprintf("admin/disk_stat_data_%v.json", aName), cl.DiskData)
+				},
+				func() error {
+					return requestAndSave(ctx, ps, fmt.Sprintf("admin/disk_stat_cache_%v.json", aName), cl.DiskCache)
+				},
+				func() error {
+					f := func(ctx context.Context) ([]byte, error) {
+						return cl.RawCPUProfile(ctx, profilerWait)
+					}
+					return requestAndSave(ctx, ps, fmt.Sprintf("admin/cpu_profile_%v.json", aName), f)
+				},
+			}
+			funcs = append(funcs, r...)
+		}
+
+		var grp multierror.Group
+		for _, f := range funcs {
+			grp.Go(f)
+		}
+		errs := grp.Wait()
+		if errs != nil {
+			rerrs = multierror.Append(rerrs, errs)
+		}
+		return rerrs.ErrorOrNil()
+	}
+}
+
+func saveMetricsAPICalls(ctx context.Context, ps *stepParams, fs afero.Fs, p *config.RpkProfile, adminAddresses []string, metricsInterval time.Duration, metricsSampleCount int) step {
+	return func() error {
+		var rerrs *multierror.Error
+		var funcs []func() error
+		for _, a := range adminAddresses {
+			a := a
+			p = &config.RpkProfile{
+				KafkaAPI: config.RpkKafkaAPI{
+					SASL: p.KafkaAPI.SASL,
+				},
+				AdminAPI: config.RpkAdminAPI{
+					Addresses: []string{a},
+					TLS:       p.AdminAPI.TLS,
+				},
+			}
+			cl, err := adminapi.NewClient(ctx, fs, p, rpadmin.ClientTimeout(ps.timeout))
+			if err != nil {
+				rerrs = multierror.Append(rerrs, fmt.Errorf("unable to initialize admin client for %q: %v", a, err))
+				continue
+			}
+
+			endpoints := map[string]func(context.Context) (io.ReadCloser, error){
+				"metrics":        metricStream(cl, "/metrics"),
+				"public_metrics": metricStream(cl, "/public_metrics"),
+			}
+
+			aName := debugbundle.SanitizeName(a)
+			for endpointName, endpoint := range endpoints {
+				endpointPoller := func() error {
+					err := requestAndSave(ctx, ps, fmt.Sprintf("metrics/%v/t0_%s.txt", aName, endpointName), endpoint)
+					if err != nil {
+						return err
+					}
+					ticker := time.NewTicker(metricsInterval)
+					defer ticker.Stop()
+
+					for count := range metricsSampleCount - 1 {
+						select {
+						case <-ticker.C:
+							err := requestAndSave(ctx, ps, fmt.Sprintf("metrics/%v/t%d_%s.txt", aName, count+1, endpointName), endpoint)
+							if err != nil {
+								return err
+							}
+						case <-ctx.Done():
+							return requestAndSave(ctx, ps, fmt.Sprintf("metrics/%v/t%d_%s.txt", aName, count+1, endpointName), endpoint)
+						}
+					}
+					return nil // Required by Golang in case metricsSampleCount == 0 - we already guard for this when arg parsing
+				}
+
+				funcs = append(funcs, endpointPoller)
+			}
+		}
+
+		var grp multierror.Group
+		for _, f := range funcs {
+			grp.Go(f)
+		}
+		errs := grp.Wait()
+		if errs != nil {
+			rerrs = multierror.Append(rerrs, errs)
+		}
+		return rerrs.ErrorOrNil()
+	}
+}
+
+func metricStream(cl *rpadmin.AdminAPI, path string) func(ctx context.Context) (io.ReadCloser, error) {
+	return func(ctx context.Context) (io.ReadCloser, error) {
+		resp, err := cl.SendOneStream(ctx, http.MethodGet, path, nil, false)
+		if err != nil {
+			return nil, err
+		}
+		return resp.Body, nil
+	}
+}
+
+// saveK8SResources will issue a GET request to the K8S API to a set of fixed
+// resources that we want to include in the bundle.
+func saveK8SResources(ctx context.Context, ps *stepParams, namespace string, labelSelector map[string]string) step {
+	return func() error {
+		clientset, pods, err := k8sPodList(ctx, namespace, labelSelector)
+		if err != nil {
+			return fmt.Errorf("unable to save k8s resources: unable to list k8s pods: %v", err)
+		}
+		// This is a safeguard, so we don't end up saving empty request for
+		// namespace who don't have any pods.
+		if len(pods.Items) == 0 {
+			return fmt.Errorf("skipping resource collection, no pods found in the %q namespace", namespace)
+		}
+
+		// We use the restInterface because it's the most straightforward
+		// approach to get namespaced resources already parsed as json.
+		restInterface := clientset.CoreV1().RESTClient()
+
+		var grp multierror.Group
+		for _, r := range []string{
+			"configmaps",
+			"endpoints",
+			"events",
+			"limitranges",
+			"persistentvolumeclaims",
+			"pods",
+			"replicationcontrollers",
+			"resourcequotas",
+			"serviceaccounts",
+			"services",
+		} {
+			r := r
+			cb := func(ctx context.Context) ([]byte, error) {
+				request := restInterface.Get().Namespace(namespace)
+				return request.Name(r).Do(ctx).Raw()
+			}
+			grp.Go(func() error { return requestAndSave(ctx, ps, fmt.Sprintf("k8s/%v.json", r), cb) })
+		}
+
+		errs := grp.Wait()
+		return errs.ErrorOrNil()
+	}
+}
+
+func saveK8SLogs(ctx context.Context, ps *stepParams, namespace, since string, logsLimitBytes int, labelSelector map[string]string) step {
+	return func() error {
+		clientset, pods, err := k8sPodList(ctx, namespace, labelSelector)
+		if err != nil {
+			return fmt.Errorf("unable to save logs: unable to list k8s pods: %v", err)
+		}
+		podsInterface := clientset.CoreV1().Pods(namespace)
+
+		limitBytes := int64(logsLimitBytes)
+		logOpts := &k8score.PodLogOptions{
+			LimitBytes: &limitBytes,
+		}
+
+		if len(since) > 0 {
+			st, err := parseJournalTime(since, time.Now())
+			if err != nil {
+				return fmt.Errorf("unable to save K8S logs: %v", err)
+			}
+			sinceTime := metav1.NewTime(st)
+			logOpts.SinceTime = &sinceTime
+		}
+
+		var grp multierror.Group
+		for _, p := range pods.Items {
+			for _, c := range p.Spec.Containers {
+				opts := logOpts.DeepCopy()
+				opts.Container = c.Name
+				cb := func(ctx context.Context) ([]byte, error) {
+					return podsInterface.GetLogs(p.Name, opts).Do(ctx).Raw()
+				}
+				grp.Go(func() error { return requestAndSave(ctx, ps, fmt.Sprintf("logs/%v-%v.txt", p.Name, c.Name), cb) })
+			}
+			for _, c := range p.Spec.InitContainers {
+				opts := logOpts.DeepCopy()
+				opts.Container = c.Name
+				cb := func(ctx context.Context) ([]byte, error) {
+					return podsInterface.GetLogs(p.Name, opts).Do(ctx).Raw()
+				}
+				grp.Go(func() error { return requestAndSave(ctx, ps, fmt.Sprintf("logs/%v-init-%v.txt", p.Name, c.Name), cb) })
+			}
+		}
+
+		errs := grp.Wait()
+		return errs.ErrorOrNil()
+	}
+}
+
+// requestAndSave receives a callback function f to be executed and marshals the
+// response into a json object that is stored in the zip writer.
+func requestAndSave[T1 any](ctx context.Context, ps *stepParams, filename string, f func(ctx context.Context) (T1, error)) error {
+	object, err := f(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to issue request for %q: %v", filename, err)
+	}
+
+	switch t := any(object).(type) {
+	case []byte:
+		err = writeFileToZip(ps, filename, t)
+		if err != nil {
+			return fmt.Errorf("unable to save output for %q: %v", filename, err)
+		}
+	case io.ReadCloser:
+		defer t.Close()
+		err = writeStreamToZip(ps, filename, t)
+		if err != nil {
+			return fmt.Errorf("unable to save output for %q: %v", filename, err)
+		}
+	default:
+		b, err := json.Marshal(object)
+		if err != nil {
+			return fmt.Errorf("unable to marshal broker response for %q: %v", filename, err)
+		}
+		err = writeFileToZip(ps, filename, b)
+		if err != nil {
+			return fmt.Errorf("unable to save output for %q: %v", filename, err)
+		}
+	}
+	return nil
+}
+
+// parseJournalTime parses the time given in 'str' relative to 'now' following
+// the systemd.time specification that is used by journalctl.
+func parseJournalTime(str string, now time.Time) (time.Time, error) {
+	/*
+		Parses time strings in multiple formats:
+
+		Standard datetime formats:
+		- "2025-08-10" (date only, assumes 00:00:00)
+		- "2025-08-10 14:30:25" (space-separated with seconds)
+		- "2025-08-10 14:30" (space-separated without seconds)
+		- "2025-08-10T14:30:25" (ISO 8601 with seconds)
+		- "2025-08-10T14:30" (ISO 8601 without seconds)
+
+		Special strings:
+		- "now" (current time)
+		- "yesterday" (00:00:00 of previous day)
+		- "today" (00:00:00 of current day)
+
+		Relative times:
+		- "+1h", "-30m", "+24h" (duration relative to current time)
+	*/
+
+	// First we ensure that we don't have any leading/trailing whitespace.
+	str = strings.TrimSpace(str)
+
+	// Try common datetime formats first
+	formats := []string{
+		"2006-01-02",          // Date only
+		"2006-01-02 15:04:05", // Space-separated with seconds
+		"2006-01-02 15:04",    // Space-separated without seconds
+		"2006-01-02T15:04:05", // ISO 8601 with seconds
+		"2006-01-02T15:04",    // ISO 8601 without seconds
+	}
+
+	for _, format := range formats {
+		if t, err := time.ParseInLocation(format, str, time.Local); err == nil {
+			return t, nil
+		}
+	}
+
+	switch str {
+	case "now":
+		return now, nil
+	case "yesterday":
+		y, m, d := now.AddDate(0, 0, -1).Date()
+		return time.Date(y, m, d, 0, 0, 0, 0, time.Local), nil
+	case "today":
+		y, m, d := now.Date()
+		return time.Date(y, m, d, 0, 0, 0, 0, time.Local), nil
+	default:
+		// This is either a relative time (+/-) or an error
+		dur, err := time.ParseDuration(str)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("unable to parse time %q: %v", str, err)
+		}
+		adjustedTime := now.Add(dur)
+		return adjustedTime, nil
+	}
+}
+
+func saveExtraFuncs(ctx context.Context, ps *stepParams, cl *rpadmin.AdminAPI, partitionFilters []topicPartitionFilter) (funcs []func() error) {
+	for _, tpf := range partitionFilters {
+		tpf := tpf
+		for _, p := range tpf.partitionsID {
+			p := p
+			funcs = append(funcs, []func() error{
+				func() error {
+					f := func(ctx context.Context) (rpadmin.Partition, error) {
+						return cl.GetPartition(ctx, tpf.namespace, tpf.topic, p)
+					}
+					return requestAndSave(ctx, ps, fmt.Sprintf("partitions/info_%v_%v_%v.json", tpf.namespace, tpf.topic, p), f)
+				},
+				func() error {
+					f := func(ctx context.Context) (rpadmin.DebugPartition, error) {
+						return cl.DebugPartition(ctx, tpf.namespace, tpf.topic, p)
+					}
+					return requestAndSave(ctx, ps, fmt.Sprintf("partitions/debug_%v_%v_%v.json", tpf.namespace, tpf.topic, p), f)
+				},
+				func() error {
+					f := func(ctx context.Context) (rpadmin.CloudStorageStatus, error) {
+						return cl.CloudStorageStatus(ctx, tpf.topic, strconv.Itoa(p))
+					}
+					return requestAndSave(ctx, ps, fmt.Sprintf("partitions/cloud_status_%v_%v.json", tpf.topic, p), f)
+				},
+				func() error {
+					f := func(ctx context.Context) (rpadmin.CloudStorageManifest, error) {
+						return cl.CloudStorageManifest(ctx, tpf.topic, p)
+					}
+					return requestAndSave(ctx, ps, fmt.Sprintf("partitions/cloud_manifest_%v_%v.json", tpf.topic, p), f)
+				},
+				func() error {
+					f := func(ctx context.Context) (rpadmin.CloudStorageAnomalies, error) {
+						return cl.CloudStorageAnomalies(ctx, tpf.namespace, tpf.topic, p)
+					}
+					return requestAndSave(ctx, ps, fmt.Sprintf("partitions/cloud_anomalies_%v_%v_%v.json", tpf.namespace, tpf.topic, p), f)
+				},
+			}...)
+		}
+	}
+	return
+}

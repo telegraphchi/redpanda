@@ -1,0 +1,1536 @@
+# Copyright 2022 Redpanda Data, Inc.
+#
+# Use of this software is governed by the Business Source License
+# included in the file licenses/BSL.md
+#
+# As of the Change Date specified in that file, in accordance with
+# the Business Source License, use of this software will be governed
+# by the Apache License, Version 2.0
+
+from __future__ import annotations
+
+import os
+import signal
+import threading
+import time
+from typing import (
+    Any,
+    Dict,
+    Sequence,
+    TypeAlias,
+    cast,
+)
+
+import requests
+from ducktape.cluster.cluster import ClusterNode
+from ducktape.cluster.remoteaccount import RemoteCommandError
+from ducktape.services.service import Service
+from ducktape.tests.test import TestContext
+from ducktape.utils.util import wait_until
+from requests.adapters import HTTPAdapter
+from urllib3 import Retry
+
+from rptest.clients.types import TopicSpec
+from rptest.services.redpanda_types import RedpandaServiceForClients
+
+# Install location, specified by Dockerfile or AMI
+TESTS_DIR = os.path.join("/opt", "kgo-verifier")
+
+REMOTE_PORT_BASE = 8080
+
+Topic: TypeAlias = str | TopicSpec
+
+
+class KgoVerifierParams:
+    def __init__(
+        self,
+        topic: Topic,
+        msg_size: int,
+        msg_count: int,
+        node: ClusterNode | None = None,
+        seq_max_msgs: int | None = None,
+        batch_max_bytes: int | None = None,
+        fake_timestamp_ms: int | None = None,
+        fake_timestamp_step_ms: int | None = None,
+        use_transactions: bool = False,
+        transaction_timeout_ms: int | None = None,
+        transaction_abort_rate: float | None = None,
+        msgs_per_transaction: int | None = None,
+        rate_limit_bps: int | None = None,
+        consume_throughput_mb: int | None = None,
+        key_set_cardinality: int | None = None,
+        msgs_per_producer_id: int | None = None,
+        max_buffered_records: int | None = None,
+        tolerate_data_loss: bool = False,
+        tolerate_failed_produce: bool = False,
+        tombstone_probability: float = 0.0,
+        client_name: str | None = None,
+        wait_for_acks: bool = True,
+        compacted: bool = False,
+        group_name: str | None = None,
+        consumer_group_readers: int | None = None,
+        max_uncommitted: int | None = None,
+    ):
+        self.topic: Topic = topic
+        self.msg_size: int = msg_size
+        self.msg_count: int = msg_count
+        self.node: ClusterNode | None = node
+        self.seq_max_msgs: int | None = seq_max_msgs
+        self.batch_max_bytes: int | None = batch_max_bytes
+        self.fake_timestamp_ms: int | None = fake_timestamp_ms
+        self.fake_timestamp_step_ms: int | None = fake_timestamp_step_ms
+        self.use_transactions: bool = use_transactions
+        self.transaction_timeout_ms: int | None = transaction_timeout_ms
+        self.transaction_abort_rate: float | None = transaction_abort_rate
+        self.msgs_per_transaction: int | None = msgs_per_transaction
+        self.rate_limit_bps: int | None = rate_limit_bps
+        self.consume_throughput_mb: int | None = consume_throughput_mb
+        self.key_set_cardinality: int | None = key_set_cardinality
+        self.msgs_per_producer_id: int | None = msgs_per_producer_id
+        self.max_buffered_records: int | None = max_buffered_records
+        self.tolerate_data_loss: bool = tolerate_data_loss
+        self.tolerate_failed_produce: bool = tolerate_failed_produce
+        self.tombstone_probability: float = tombstone_probability
+        self.client_name: str | None = client_name
+        self.wait_for_acks: bool = wait_for_acks
+        self.compacted: bool = compacted
+        self.group_name: str | None = group_name
+        self.consumer_group_readers: int | None = consumer_group_readers
+        self.max_uncommitted: int | None = max_uncommitted
+
+
+class KgoVerifierService(Service):
+    """
+    KgoVerifierService is kgo-verifier service.
+    To validate produced record user should run consumer and producer in one node.
+    Use ctx.cluster.alloc(ClusterSpec.simple_linux(1)) to allocate node and pass it to constructor
+    """
+
+    def __init__(
+        self,
+        context: Any,
+        redpanda: RedpandaServiceForClients,
+        topic: Topic,
+        custom_node: list[ClusterNode] | None,
+        debug_logs: bool,
+        trace_logs: bool,
+        username: str | None = None,
+        password: str | None = None,
+        enable_tls: bool = False,
+    ):
+        self.use_custom_node = custom_node is not None
+
+        # We should pass num_nodes to allocate for our service in BackgroundThreadService,
+        # but if user allocate node by themself, BackgroundThreadService should not allocate any nodes
+        nodes_for_allocate = 1
+        if self.use_custom_node:
+            nodes_for_allocate = 0
+
+        super(KgoVerifierService, self).__init__(context, num_nodes=nodes_for_allocate)
+
+        # Should check that BackgroundThreadService did not allocate anything
+        # and store allocated nodes by user to self.nodes
+        if self.use_custom_node:
+            assert not self.nodes
+            assert custom_node is not None
+            self.nodes = custom_node
+
+        self._redpanda: RedpandaServiceForClients = redpanda
+        self._topic = topic
+        self._pid = None
+        self._remote_port = None
+        self._debug_logs = debug_logs
+        self._trace_logs = trace_logs
+        self._username = username
+        self._password = password
+        self._enable_tls = enable_tls
+        self._status: "ProduceStatus | ConsumerStatus"
+        self._status_thread: StatusThread | None = None
+        self._stopped: bool = False
+        self.logs = {
+            "kgo_verifier_output": {"path": self.log_path, "collect_default": True}
+        }
+
+        # if testing redpanda cloud, override with default test super user/pass
+        if hasattr(redpanda, "GLOBAL_CLOUD_CLUSTER_CONFIG"):
+            security_config = redpanda.kafka_client_security()
+            if security_config.sasl_enabled:
+                self._username = security_config.username
+                self._password = security_config.password
+            self._enable_tls = security_config.tls_enabled
+
+        for node in self.nodes:
+            if not hasattr(node, "kgo_verifier_ports"):
+                setattr(node, "kgo_verifier_ports", {})
+
+        self._status_thread = None
+        self._stopped = False
+
+    def __del__(self):
+        self._release_port()
+
+    # when switched to 3.11 change return type to `Self`
+    @classmethod
+    def oneshot(cls, *args: Any, **kwargs: Any) -> Any:
+        """
+        Convenience method for constructing, running and releasing node.
+
+        Invoke with the same arguments as constructor, and optionally also
+        `timeout_sec` if you would like to configure the wait timeout.
+
+        Returns the finished instance, so that one can read its status methods
+        to verify message counts etc
+        """
+
+        if "timeout_sec" in kwargs:
+            timeout_kwargs = {"timeout_sec": kwargs.pop("timeout_sec")}
+        else:
+            timeout_kwargs = {}
+
+        inst = cls(*args, **kwargs)
+        inst.start()
+        inst.wait(**timeout_kwargs)
+        inst.free()
+        return inst
+
+    def process_name(self) -> str:
+        return f"{super().who_am_i()}.{self._topic}"
+
+    def _release_port(self) -> None:
+        for node in self.nodes:
+            port_map = getattr(node, "kgo_verifier_ports", dict())
+            if self.who_am_i() in port_map:
+                del port_map[self.who_am_i()]
+
+    def _select_port(self, node: ClusterNode) -> int:
+        ports_in_use = set(getattr(node, "kgo_verifier_ports", {}).values())
+        i = REMOTE_PORT_BASE
+        while i in ports_in_use:
+            i = i + 1
+
+        getattr(node, "kgo_verifier_ports", {})[self.process_name()] = i
+        return i
+
+    @property
+    def log_path(self) -> str:
+        return f"/tmp/{self.process_name()}.log"
+
+    def _log_node_network_state(self, node: ClusterNode) -> None:
+        """
+        For debugging issues around starting and stopping processes: log which ports are in use.
+        """
+        self.logger.debug(
+            f"Gathering port usage information with 'netstat -panelot' on {node.name} while starting {self.who_am_i()}"
+        )
+
+        # Capture general process informatio
+
+        # Capture network information
+        for line in node.account.ssh_capture("netstat -panelot", timeout_sec=30):
+            self.logger.debug(line.strip())
+
+    def spawn(self, cmd: str, node: ClusterNode) -> None:
+        assert self._pid is None
+        self._log_node_network_state(node)
+        self._remote_port = self._select_port(node)
+
+        debug = "--debug" if self._debug_logs else ""
+        trace = "--trace" if self._trace_logs else ""
+        wrapped_cmd = f"nohup {cmd} --remote --remote-port {self._remote_port} {debug} {trace}>> {self.log_path} 2>&1 & echo $!"
+        self.logger.debug(f"spawn {self.who_am_i()}: {wrapped_cmd}")
+        pid_str = node.account.ssh_output(wrapped_cmd, timeout_sec=10)
+        self.logger.debug(
+            f"spawned {self.who_am_i()} node={node.name} pid={pid_str} port={self._remote_port}"
+        )
+        pid = int(pid_str.strip())
+        self._pid = pid
+
+        # Wait for status endpoint to respond.
+        self._await_ready(node)
+
+        # Because the above command was run with `nohup` we can't be sure that
+        # it is the one who actually replied to the `await_ready` calls.
+        # Check that the PID we just launched is still running as a confirmation
+        # that it is the one.
+        self._assert_running(node)
+        self._stopped = False
+
+    def _await_ready(self, node: ClusterNode) -> None:
+        """
+        Wait for the remote processes http endpoint to come up
+        """
+
+        wait_until(
+            lambda: self._is_ready(node),
+            timeout_sec=30,
+            backoff_sec=0.5,
+            err_msg=f"Timed out waiting for status endpoint {self.who_am_i()} to be available",
+        )
+
+    def _is_ready(self, node: ClusterNode) -> bool:
+        try:
+            r = requests.get(self._remote_url(node, "status"), timeout=10)
+        except Exception as e:
+            # Broad exception handling for any lower level connection errors etc
+            # that might not be properly classed as `requests` exception.
+            self.logger.debug(f"Status endpoint {self.who_am_i()} not ready: {e}")
+            return False
+        else:
+            return r.status_code == 200
+
+    def _assert_running(self, node: ClusterNode) -> None:
+        node.account.ssh_output(f"ps -p {self._pid}", allow_fail=False)
+
+    def stop_node(self, node: ClusterNode, **kwargs: Any) -> None:
+        error = None
+        if self._status_thread:
+            self._status_thread.stop()
+            try:
+                self._status_thread.raise_on_error()
+            except Exception as e:
+                error = e
+            self._status_thread = None
+            # Record that we just stopped, so that we can't wait() after.
+            # This is done inside this if statement because stop_node() is also
+            # called during the start of the service to potentially stop a previous
+            # instance of the service. Here, we know that we are stopping the service
+            # that we started because it was us who initialized the _status_thread.
+            self._stopped = True
+
+        if self._pid is None:
+            return
+
+        self._redpanda.logger.info(f"{self.__class__.__name__}.stop")
+        self.logger.debug("Killing pid %s" % {self._pid})
+        try:
+            node.account.signal(self._pid, signal.SIGKILL, allow_fail=False)
+        except RemoteCommandError as e:
+            if "No such process" not in str(e.msg):
+                raise
+
+        self._pid = None
+        self._release_port()
+        if error:
+            raise error
+
+    def clean_node(self, node: ClusterNode, **kwargs: Any) -> None:
+        self._redpanda.logger.info(f"{self.__class__.__name__}.clean_node")
+        node.account.kill_process("kgo-verifier", clean_shutdown=False)
+        node.account.remove("valid_offsets*json", True)
+        node.account.remove("latest_value*json", True)
+        node.account.remove(f"/tmp/{self.__class__.__name__}*", True)
+
+    def _remote(self, node: ClusterNode, action: str, timeout: int = 60) -> None:
+        """
+        Send a request to the node to perform the given action, retrying
+        periodically up to the given timeout.
+        """
+        url = self._remote_url(node, action)
+        self._redpanda.logger.info(f"{self.who_am_i()} remote call: {url}")
+        deadline = time.time() + timeout
+        last_error = None
+        while time.time() < deadline:
+            try:
+                r = requests.get(url, timeout=10)
+                r.raise_for_status()
+                return
+            except Exception as e:
+                last_error = e
+                self._redpanda.logger.warning(
+                    f"{self.who_am_i()} remote call failed, {e}"
+                )
+                time.sleep(3)
+        if last_error:
+            raise last_error
+
+    def wait_node(self, node: ClusterNode, timeout_sec: float | None = None) -> Any:
+        """
+        Wrapper to catch timeouts on wait, and send a `/print_stack` to the remote
+        process in case it is experiencing a hang bug.
+        """
+        assert not self._stopped, (
+            f"Can't wait {self.who_am_i()}. It was already stopped. You can either stop() a service or wait() and then stop() it but not the other way around."
+        )
+
+        assert timeout_sec, "timeout must be provided"
+
+        try:
+            return self._do_wait_node(node, timeout_sec)
+        except:
+            try:
+                self._remote(node, "print_stack")
+            except Exception as e:
+                self._redpanda.logger.warning(
+                    f"{self.who_am_i()} failed to print stacks during wait failure: {e}"
+                )
+
+            raise
+
+    @property
+    def status_thread(self) -> StatusThread:
+        assert self._status_thread is not None
+        return self._status_thread
+
+    def _do_wait_node(self, node: ClusterNode, timeout_sec: float) -> bool:
+        """
+        Wait for the remote process to gracefully finish: if it is a one-shot
+        operation this waits for all work to complete, if it is a looping
+        operation then we wait for the current iteration of the loop to finish
+        by triggering the /last_pass endpoint and then waiting for active=false.
+
+        When this returns, the remote process is no longer running, and our
+        _status member is populated with the final status before the remote process
+        process ended.
+        """
+        if not self._status_thread:
+            return True
+
+        self.logger.debug(f"wait_node {self.who_am_i()}: waiting for remote endpoint")
+        self._await_ready(node)
+
+        # If this is a looping worker, tell it to end after the current loop
+        self.logger.debug(f"wait_node {self.who_am_i()}: requesting last_pass")
+        self._remote(node, "last_pass")
+
+        # Let the worker fall through to the end of its current iteration
+        self.logger.debug(
+            f"wait_node {self.who_am_i()}: waiting for worker to complete"
+        )
+        self._redpanda.wait_until(
+            lambda: self._status.active is False or self.status_thread.errored,
+            timeout_sec=timeout_sec,
+            backoff_sec=5,
+            err_msg=f"{self.who_am_i()} didn't complete in {timeout_sec} seconds",
+        )
+        self.status_thread.raise_on_error()
+
+        # Read final status
+        self.logger.debug(f"wait_node {self.who_am_i()}: reading final status")
+        self.status_thread.shutdown()
+        self._status_thread = None
+
+        # Permit the subprocess to exit, and wait for it to do so
+        self.logger.debug(f"wait_node {self.who_am_i()}: requesting shutdown")
+        try:
+            self._remote(node, "shutdown")
+        except requests.exceptions.ConnectionError:
+            # It is permitted for the remote process to abort connection and fail
+            # to send a response, as it does not wait for HTTP response to flush
+            # before shutting down.
+            pass
+
+        self.logger.debug(
+            f"wait_node {self.who_am_i()}: waiting node={node.name} pid={self._pid} to terminate"
+        )
+        wait_until(
+            lambda: not node.account.exists(f"/proc/{self._pid}"),
+            timeout_sec=10,
+            backoff_sec=0.5,
+        )
+        self._pid = None
+
+        self.logger.debug(
+            f"wait_node {self.who_am_i()}: node={node.name} pid={self._pid} terminated"
+        )
+
+        self._release_port()
+        self._stopped = True
+
+        return True
+
+    def _remote_url(self, node: ClusterNode, path: str) -> str:
+        assert self._remote_port is not None
+        return f"http://{node.account.hostname}:{self._remote_port}/{path}"
+
+    def allocate_nodes(self) -> None:
+        if self.use_custom_node:
+            return
+        else:
+            return super(KgoVerifierService, self).allocate_nodes()
+
+    def do_free(self) -> None:
+        if self.use_custom_node:
+            return
+        else:
+            return super(KgoVerifierService, self).free()
+
+    def free(self) -> None:
+        assert self._stopped, "Cannot free KgoVerifierService before stopping it"
+        self.do_free()
+
+
+class StatusThread(threading.Thread):
+    INTERVAL = 5
+
+    def __init__(
+        self,
+        parent: KgoVerifierService,
+        node: ClusterNode,
+        status_cls: type,
+        *args: Any,
+        **kwargs: Any,
+    ):
+        super().__init__(*args, **kwargs)
+        self.daemon = True
+
+        self._parent = parent
+        self._node = node
+        self._status_cls = status_cls
+        self._ex: Exception | None = None
+        self._ready = False
+
+        self._shutdown_requested = threading.Event()
+        self._stop_requested = threading.Event()
+
+    @property
+    def errored(self) -> bool:
+        return self._ex is not None
+
+    @property
+    def who_am_i(self) -> str:
+        return self._parent.who_am_i()
+
+    @property
+    def logger(self) -> Any:
+        return self._parent.logger
+
+    def raise_on_error(self) -> None:
+        if self._ex is not None:
+            raise self._ex
+
+    def run(self) -> None:
+        try:
+            self.poll_status()
+        except Exception as ex:
+            self._ex = ex
+            self.logger.exception(
+                f"Error reading status from {self.who_am_i} on {self._node.name}"
+            )
+
+    def _ingest_status(self, worker_statuses: list[dict[str, Any]]) -> None:
+        self.logger.debug(f"{self.who_am_i} status: {worker_statuses}")
+        reduced = self._status_cls(**worker_statuses[0])
+        for s in worker_statuses[1:]:
+            reduced.merge(self._status_cls(**s))
+
+        if isinstance(self._parent, KgoVerifierProducer):
+            parent: KgoVerifierProducer = self._parent
+            progress = worker_statuses[0]["sent"] / float(parent._msg_count)
+            self.logger.info(
+                f"Producer {self.who_am_i} progress: {progress * 100:.2f}% {reduced}"
+            )
+        else:
+            self.logger.info(f"Worker {self.who_am_i} status: {reduced}")
+
+        self._parent._status = reduced
+
+    def poll_status(self) -> None:
+        retry_strategy = Retry(
+            total=5,
+            connect=5,
+            read=5,
+            backoff_factor=0.3,
+            status=5,
+            allowed_methods=["GET"],
+            status_forcelist=[503, 504],
+        )
+        session = requests.Session()
+        session.mount("http://", HTTPAdapter(max_retries=retry_strategy))
+
+        while not self._stop_requested.is_set():
+            drop_out = self._shutdown_requested.is_set()
+            r = session.get(
+                url=self._parent._remote_url(self._node, "status"), timeout=5
+            )
+            r.raise_for_status()
+            worker_statuses = r.json()
+            self._ingest_status(worker_statuses)
+
+            if drop_out:
+                # We were asked to clean shutdown and we have done our final
+                # status read
+                return
+            else:
+                self._shutdown_requested.wait(self.INTERVAL)
+
+    def join_with_timeout(self) -> None:
+        """
+        Join thread with a modest timeout, and raise an exception if
+        we do not succeed.  We expect to join promptly because all our
+        run() is doing is calling to the remote process status endpoint, and
+        that requests.get() has a timeout on it, so should not block.
+
+        This is important because otherwise a stuck join() would hang
+        the entire ducktape test run.
+        """
+        self.join(timeout=10)
+        if self.is_alive():
+            msg = f"Failed to join thread for {self.who_am_i}"
+            self.logger.error(msg)
+            raise RuntimeError(msg)
+
+    def stop(self) -> None:
+        """
+        Drop out of poll loop as soon as possible, and join.
+        """
+        self._shutdown_requested.set()
+        self._stop_requested.set()
+        self.join_with_timeout()
+
+    def shutdown(self):
+        """
+        Read status one more time, then drop out of poll loop and join.
+        """
+        self._shutdown_requested.set()
+        self.join_with_timeout()
+
+
+class ValidatorStatus:
+    """
+    All validating consumers have one of these as part of their status object
+    internally to kgo-verifier.  Other parts of consumer status are allowed to
+    differ per-worker, although at time of writing they don't.
+    """
+
+    lost_offsets: Dict[str, int]
+
+    def __init__(
+        self,
+        name: str,
+        valid_reads: int,
+        invalid_reads: int,
+        offset_gaps: int,
+        out_of_scope_invalid_reads: int,
+        max_offsets_consumed: Dict[int, int],
+        lost_offsets: Dict[str, int],
+        tombstones_consumed: int,
+    ):
+        # Validator name is just a unique name per worker thread in kgo-verifier: useful in logging
+        # but we mostly don't care
+        self.name = name
+
+        self.valid_reads = valid_reads
+        self.invalid_reads = invalid_reads
+        self.offset_gaps = offset_gaps
+        self.out_of_scope_invalid_reads = out_of_scope_invalid_reads
+        self.max_offsets_consumed = max_offsets_consumed
+        self.lost_offsets = lost_offsets
+        self.tombstones_consumed = tombstones_consumed
+
+    @property
+    def total_reads(self):
+        # At time of writing, invalid reads is never nonzero, because the program
+        # terminates as soon as it sees an invalid read
+        return self.valid_reads + self.out_of_scope_invalid_reads
+
+    def merge(self, rhs: ValidatorStatus):
+        # Clear name if we are merging multiple statuses together, to avoid confusion.
+        self.name = ""
+
+        # Clear other fields we aren't interested in, to avoid confusion.
+        self.max_offsets_consumed = {}
+        self.lost_offsets = {}
+
+        self.valid_reads += rhs.valid_reads
+        self.invalid_reads += rhs.invalid_reads
+        self.offset_gaps += rhs.offset_gaps
+        self.out_of_scope_invalid_reads += rhs.out_of_scope_invalid_reads
+
+    def __str__(self):
+        return (
+            f"ValidatorStatus<"
+            f"valid_reads={self.valid_reads}, "
+            f"invalid_reads={self.invalid_reads}, "
+            f"offset_gaps={self.offset_gaps}, "
+            f"out_of_scope_invalid_reads={self.out_of_scope_invalid_reads}, "
+            f"lost_offsets={self.lost_offsets}, "
+            f"tombstones_consumed={self.tombstones_consumed}>"
+        )
+
+
+class ConsumerStatus:
+    def __init__(
+        self,
+        topic: Topic,
+        validator: dict[str, Any] | None = None,
+        errors: int = 0,
+        active: bool = True,
+    ):
+        """
+        `active` defaults to True, because we use it for deciding when to drop out in `wait()` -- the initial
+        state of a worker should be presumed that it is busy, and we must wait to see it go `active=False`
+        before proceeding with `wait()`
+        """
+        if validator is None:
+            validator = {
+                "valid_reads": 0,
+                "invalid_reads": 0,
+                "offset_gaps": 0,
+                "out_of_scope_invalid_reads": 0,
+                "name": "",
+                "max_offsets_consumed": dict(),
+                "lost_offsets": dict(),
+                "tombstones_consumed": 0,
+            }
+
+        self.topic = topic
+        self.validator = ValidatorStatus(**validator)
+        self.errors = errors
+        self.active = active
+
+    def merge(self, rhs: ConsumerStatus):
+        self.active = self.active or rhs.active
+        self.errors += rhs.errors
+        self.validator.merge(rhs.validator)
+
+    def __str__(self):
+        return f"ConsumerStatus<{self.topic}: {self.active}, {self.errors}, {self.validator}>"
+
+
+class KgoVerifierProducer(KgoVerifierService):
+    def __init__(
+        self,
+        context: TestContext,
+        redpanda: RedpandaServiceForClients,
+        topic: Topic,
+        msg_size: int,
+        msg_count: int,
+        custom_node: list[ClusterNode] | None = None,
+        batch_max_bytes: int | None = None,
+        debug_logs: bool = False,
+        trace_logs: bool = False,
+        fake_timestamp_ms: int | None = None,
+        fake_timestamp_step_ms: int | None = None,
+        use_transactions: bool = False,
+        transaction_timeout_ms: int | None = None,
+        transaction_abort_rate: float | None = None,
+        msgs_per_transaction: int | None = None,
+        rate_limit_bps: int | None = None,
+        key_set_cardinality: int | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        enable_tls: bool = False,
+        msgs_per_producer_id: int | None = None,
+        max_buffered_records: int | None = None,
+        tolerate_data_loss: bool = False,
+        tolerate_failed_produce: bool = False,
+        tombstone_probability: float = 0.0,
+        validate_latest_values: bool = False,
+        client_name: str | None = None,
+        wait_for_acks: bool = True,
+    ):
+        super(KgoVerifierProducer, self).__init__(
+            context,
+            redpanda,
+            topic,
+            custom_node,
+            debug_logs,
+            trace_logs,
+            username,
+            password,
+            enable_tls,
+        )
+        self._msg_size = msg_size
+        self._msg_count = msg_count
+        self._status = ProduceStatus(self._topic)
+        self._batch_max_bytes = batch_max_bytes
+        self._fake_timestamp_ms = fake_timestamp_ms
+        self._fake_timestamp_step_ms = fake_timestamp_step_ms
+        self._use_transactions = use_transactions
+        self._transaction_timeout_ms = transaction_timeout_ms
+        self._transaction_abort_rate = transaction_abort_rate
+        self._msgs_per_transaction = msgs_per_transaction
+        self._rate_limit_bps = rate_limit_bps
+        self._key_set_cardinality = key_set_cardinality
+        self._msgs_per_producer_id = msgs_per_producer_id
+        self._max_buffered_records = max_buffered_records
+        self._tolerate_data_loss = tolerate_data_loss
+        self._tolerate_failed_produce = tolerate_failed_produce
+        self._tombstone_probability = tombstone_probability
+        self._validate_latest_values = validate_latest_values
+        self._client_name = client_name
+        self._wait_for_acks = wait_for_acks
+
+    @property
+    def produce_status(self) -> ProduceStatus:
+        assert self._status is not None and isinstance(self._status, ProduceStatus)
+        return self._status
+
+    def wait_node(self, node: ClusterNode, timeout_sec: float | None = None) -> Any:
+        assert not self._stopped, (
+            f"Can't wait {self.who_am_i()}. It was already stopped. You can either stop() a service or wait() and then stop() it but not the other way around."
+        )
+
+        if not self._status_thread:
+            return True
+
+        what = (
+            f"{self.who_am_i()} wait: awaiting message count on topic '{self._topic}'"
+        )
+        self.logger.debug(what)
+
+        def is_finished() -> bool:
+            has_error = self.status_thread.errored
+            msg_count = (
+                self.produce_status.acked
+                if self._wait_for_acks
+                else self.produce_status.sent
+            )
+            return has_error or msg_count >= self._msg_count
+
+        try:
+            self._redpanda.wait_until(
+                is_finished,
+                timeout_sec=timeout_sec if timeout_sec is not None else 30,
+                backoff_sec=self._status_thread.INTERVAL,
+                err_msg=what,
+            )
+        except:
+            self.stop_node(node)
+            raise
+
+        self._status_thread.raise_on_error()
+
+        if self.produce_status.bad_offsets != 0:
+            # This either means that the test sent multiple producers' traffic to
+            # the same topic, or that Redpanda showed a buggy behavior with
+            # idempotency: producer records should always land at the next offset
+            # after the last record they wrote.
+            if self._tolerate_data_loss:
+                self._redpanda.logger.warning(
+                    f"{self.who_am_i()} observed data loss: {self._status}"
+                )
+            else:
+                raise RuntimeError(
+                    f"{self.who_am_i()} possible idempotency bug: {self._status}"
+                )
+
+        return super().wait_node(node, timeout_sec=timeout_sec)
+
+    def wait_for_acks(
+        self,
+        count: int,
+        timeout_sec: float,
+        backoff_sec: float,
+        progress_sec: float | None = None,
+    ) -> None:
+        def acks() -> int:
+            return self.produce_status.acked
+
+        def acks_at_count() -> bool:
+            return self.status_thread.errored or acks() >= count
+
+        if progress_sec is not None:
+            self._redpanda.wait_until_with_progress_check(
+                acks,
+                acks_at_count,
+                timeout_sec,
+                progress_sec,
+                backoff_sec,
+                logger=self._redpanda.logger,
+            )
+        else:
+            self._redpanda.wait_until(
+                acks_at_count,
+                timeout_sec=timeout_sec,
+                backoff_sec=backoff_sec,
+            )
+        self.status_thread.raise_on_error()
+
+    def _wait_for_file_on_nodes(self, file_name: str, timeout_sec: int = 60) -> None:
+        self._redpanda.wait_until(
+            lambda: self.status_thread.errored
+            or all(node.account.exists(file_name) for node in self.nodes),
+            timeout_sec=timeout_sec,
+            backoff_sec=1,
+            err_msg=f"Timed out waiting for {file_name} to be created",
+        )
+        self.status_thread.raise_on_error()
+
+    def wait_for_offset_map(self, timeout_sec: int = 60) -> None:
+        # Producer worker aims to checkpoint every 5 seconds, so we should see this promptly.
+        offset_map_file_name = f"valid_offsets_{self._topic}.json"
+        self._wait_for_file_on_nodes(offset_map_file_name, timeout_sec=timeout_sec)
+
+    def wait_for_latest_value_map(self, timeout_sec: int = 60) -> None:
+        # Producer worker aims to checkpoint every 5 seconds, so we should see this promptly.
+        value_map_file_name = f"latest_value_{self._topic}.json"
+        self._wait_for_file_on_nodes(value_map_file_name, timeout_sec=timeout_sec)
+
+    def is_complete(self) -> bool:
+        return self.produce_status.acked >= self._msg_count
+
+    def client_name(self) -> str:
+        return self._client_name if self._client_name else self.who_am_i()
+
+    def start_node(self, node: ClusterNode, clean: bool = False, **kwargs: Any) -> None:
+        if clean:
+            self.clean_node(node, **kwargs)
+
+        cmd = f"{TESTS_DIR}/kgo-verifier --brokers {self._redpanda.brokers()} --topic {self._topic} --msg_size {self._msg_size} --produce_msgs {self._msg_count} --rand_read_msgs 0 --seq_read=0 --client-name {self.client_name()}"
+
+        if self._username is not None:
+            cmd = cmd + f" --username {self._username}"
+
+        if self._password is not None:
+            cmd = cmd + f" --password {self._password}"
+
+        if self._enable_tls:
+            cmd = cmd + " --enable-tls"
+
+        if self._batch_max_bytes is not None:
+            cmd = cmd + f" --batch_max_bytes {self._batch_max_bytes}"
+
+        if self._fake_timestamp_ms is not None:
+            cmd = cmd + f" --fake-timestamp-ms {self._fake_timestamp_ms}"
+
+        if self._fake_timestamp_step_ms is not None:
+            cmd = cmd + f" --fake-timestamp-step-ms {self._fake_timestamp_step_ms}"
+
+        if self._use_transactions:
+            cmd = cmd + " --use-transactions"
+
+            if self._transaction_timeout_ms is not None:
+                cmd += f" --transaction-timeout-ms {self._transaction_timeout_ms}ms"
+
+            if self._msgs_per_transaction is not None:
+                cmd = cmd + f" --msgs-per-transaction {self._msgs_per_transaction}"
+
+            if self._transaction_abort_rate is not None:
+                cmd = cmd + f" --transaction-abort-rate {self._transaction_abort_rate}"
+
+        if self._rate_limit_bps is not None:
+            cmd = cmd + f" --produce-throughput-bps {self._rate_limit_bps}"
+
+        if self._key_set_cardinality is not None:
+            cmd += f" --key-set-cardinality {self._key_set_cardinality}"
+        if self._msgs_per_producer_id is not None:
+            cmd += f" --msgs-per-producer-id {self._msgs_per_producer_id}"
+
+        if self._max_buffered_records is not None:
+            cmd += f" --max-buffered-records {self._max_buffered_records}"
+
+        if self._tolerate_data_loss:
+            cmd += " --tolerate-data-loss"
+
+        if self._tolerate_failed_produce:
+            cmd += " --tolerate-failed-produce"
+
+        if self._tombstone_probability is not None:
+            cmd += f" --tombstone-probability {self._tombstone_probability}"
+        if self._validate_latest_values:
+            cmd += " --validate-latest-values"
+
+        self.spawn(cmd, node)
+        self._status_thread = StatusThread(self, node, ProduceStatus)
+        self._status_thread.start()
+
+
+class AbstractConsumer(KgoVerifierService):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._status = ConsumerStatus(self._topic)
+
+    @property
+    def consumer_status(self) -> ConsumerStatus:
+        assert self._status is not None and isinstance(self._status, ConsumerStatus)
+        return cast(ConsumerStatus, self._status)
+
+    def wait_total_reads(
+        self, count: int, timeout_sec: float, backoff_sec: float
+    ) -> None:
+        self.logger.info("Waiting for total reads to reach %d", count)
+
+        self._redpanda.wait_until(
+            lambda: self.status_thread.errored
+            or self.consumer_status.validator.total_reads >= count,
+            timeout_sec=timeout_sec,
+            backoff_sec=backoff_sec,
+        )
+        self.status_thread.raise_on_error()
+
+
+class KgoVerifierSeqConsumer(AbstractConsumer):
+    def __init__(
+        self,
+        context: Any,
+        redpanda: RedpandaServiceForClients,
+        topic: Topic,
+        msg_size: int | None = None,  # TODO: redundant, remove
+        max_msgs: int | None = None,
+        max_throughput_mb: int | None = None,
+        nodes: list[ClusterNode] | None = None,
+        debug_logs: bool = False,
+        trace_logs: bool = False,
+        loop: bool = True,
+        continuous: bool = False,
+        tolerate_data_loss: bool = False,
+        producer: KgoVerifierProducer | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        enable_tls: bool | None = False,
+        use_transactions: bool | None = False,
+        compacted: bool | None = False,
+        validate_latest_values: bool | None = False,
+    ):
+        super().__init__(
+            context,
+            redpanda,
+            topic,
+            nodes,
+            debug_logs,
+            trace_logs,
+            username,
+            password,
+            enable_tls,
+        )
+        self._max_msgs = max_msgs
+        self._max_throughput_mb = max_throughput_mb
+        self._loop = loop
+        self._continuous = continuous
+        self._tolerate_data_loss = tolerate_data_loss
+        self._producer = producer
+        self._use_transactions = use_transactions
+        self._compacted = compacted
+        self._validate_latest_values = validate_latest_values
+
+    def start_node(self, node: ClusterNode, clean: bool = False, **kwargs) -> None:
+        assert not kwargs, f"Unexpected kwargs: {kwargs}"
+
+        if clean:
+            self.clean_node(node)
+
+        loop = "--loop" if self._loop else ""
+        cmd = f"{TESTS_DIR}/kgo-verifier --brokers {self._redpanda.brokers()} --topic {self._topic} --produce_msgs 0 --rand_read_msgs 0 --seq_read=1 {loop} --client-name {self.who_am_i()}"
+        if self._username is not None:
+            cmd = cmd + f" --username {self._username}"
+        if self._password is not None:
+            cmd = cmd + f" --password {self._password}"
+        if self._enable_tls:
+            cmd = cmd + " --enable-tls"
+        if self._max_msgs is not None:
+            cmd += f" --seq_read_msgs {self._max_msgs}"
+        if self._max_throughput_mb is not None:
+            cmd += f" --consume-throughput-mb {self._max_throughput_mb}"
+        if self._continuous:
+            cmd += " --continuous"
+        if self._tolerate_data_loss:
+            cmd += " --tolerate-data-loss"
+        if self._use_transactions:
+            cmd += " --use-transactions"
+        if self._compacted:
+            cmd += " --compacted"
+        if self._validate_latest_values:
+            cmd += " --validate-latest-values"
+
+        self.spawn(cmd, node)
+
+        self._status_thread = StatusThread(self, node, ConsumerStatus)
+        self._status_thread.start()
+
+    def wait_node(self, node: ClusterNode, timeout_sec: float | None = None) -> Any:
+        assert not self._stopped, (
+            f"Can't wait {self.who_am_i()}. It was already stopped. You can either stop() a service or wait() and then stop() it but not the other way around."
+        )
+
+        assert timeout_sec, "timeout must be provided"
+
+        if self._producer:
+            producer: KgoVerifierProducer = self._producer
+
+            def consumed_whole_log() -> bool:
+                producer_done = producer.produce_status.sent == producer._msg_count
+                if not producer_done:
+                    self.logger.debug(
+                        f"Producer {producer.who_am_i()} hasn't finished yet"
+                    )
+                    return False
+
+                consumed = self.consumer_status.validator.max_offsets_consumed
+                produced = producer.produce_status.max_offsets_produced
+                if consumed != produced:
+                    self.logger.debug(
+                        f"Consumer {self.who_am_i()} hasn't read all produced data yet: {consumed=} {produced=}"
+                    )
+                    return False
+                return True
+
+            wait_until(
+                consumed_whole_log,
+                timeout_sec=timeout_sec,
+                backoff_sec=2,
+                err_msg=f"Consumer hasn't read all produced data: consumed={self.consumer_status.validator.max_offsets_consumed} produced={self._producer.produce_status.max_offsets_produced}",
+            )
+
+        return super().wait_node(node, timeout_sec=timeout_sec)
+
+
+class KgoVerifierRandomConsumer(AbstractConsumer):
+    def __init__(
+        self,
+        context: Any,
+        redpanda: RedpandaServiceForClients,
+        topic: Topic,
+        msg_size: int,
+        rand_read_msgs: int,
+        parallel: int,
+        nodes: list[ClusterNode] | None = None,
+        debug_logs: bool = False,
+        trace_logs: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        enable_tls: bool = False,
+        use_transactions: bool | None = False,
+    ):
+        super().__init__(
+            context,
+            redpanda,
+            topic,
+            nodes,
+            debug_logs,
+            trace_logs,
+            username,
+            password,
+            enable_tls,
+        )
+        self._rand_read_msgs = rand_read_msgs
+        self._parallel = parallel
+        self._use_transactions = use_transactions
+
+    def start_node(self, node: ClusterNode, clean: bool = False, **kwargs) -> None:
+        assert not kwargs, f"Unexpected kwargs: {kwargs}"
+
+        if clean:
+            self.clean_node(node)
+
+        cmd = f"{TESTS_DIR}/kgo-verifier --brokers {self._redpanda.brokers()} --topic {self._topic} --produce_msgs 0 --rand_read_msgs {self._rand_read_msgs} --parallel {self._parallel} --seq_read=0 --loop --client-name {self.who_am_i()}"
+        if self._username is not None:
+            cmd = cmd + f" --username {self._username}"
+        if self._password is not None:
+            cmd = cmd + f" --password {self._password}"
+        if self._enable_tls:
+            cmd = cmd + " --enable-tls"
+        if self._use_transactions:
+            cmd += " --use-transactions"
+
+        self.spawn(cmd, node)
+
+        self._status_thread = StatusThread(self, node, ConsumerStatus)
+        self._status_thread.start()
+
+
+class KgoVerifierConsumerGroupConsumer(AbstractConsumer):
+    _status: ConsumerStatus
+    _group_name: str | None
+
+    def __init__(
+        self,
+        context: Any,
+        redpanda: RedpandaServiceForClients,
+        topic: Topic,
+        msg_size: int,
+        readers: int,
+        loop: bool = False,
+        max_msgs: int | None = None,
+        max_throughput_mb: int | None = None,
+        nodes: list[ClusterNode] | None = None,
+        debug_logs: bool = False,
+        trace_logs: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        enable_tls: bool = False,
+        continuous: bool = False,
+        tolerate_data_loss: bool = False,
+        group_name: str | None = None,
+        max_uncommitted: int | None = None,  # None means rely on auto commit
+        use_transactions: bool = False,
+        compacted: bool = False,
+        validate_latest_values: bool = False,
+    ):
+        super().__init__(
+            context,
+            redpanda,
+            topic,
+            nodes,
+            debug_logs,
+            trace_logs,
+            username,
+            password,
+            enable_tls,
+        )
+
+        self._readers = readers
+        self._loop = loop
+        self._max_msgs = max_msgs
+        self._max_throughput_mb = max_throughput_mb
+        self._group_name = group_name
+        assert max_uncommitted is None or max_uncommitted > 0, (
+            "max_uncommitted must be positive or None"
+        )
+        self._max_uncommitted = max_uncommitted
+        self._continuous = continuous
+        self._tolerate_data_loss = tolerate_data_loss
+        self._use_transactions = use_transactions
+        self._compacted = compacted
+        self._validate_latest_values = validate_latest_values
+
+    def start_node(self, node: ClusterNode, clean: bool = False, **kwargs: Any) -> None:
+        if clean:
+            self.clean_node(node, **kwargs)
+
+        cmd = f"{TESTS_DIR}/kgo-verifier --brokers {self._redpanda.brokers()} --topic {self._topic} --produce_msgs 0 --rand_read_msgs 0 --seq_read=0 --consumer_group_readers={self._readers} --client-name {self.who_am_i()}"
+        if self._username is not None:
+            cmd = cmd + f" --username {self._username}"
+        if self._password is not None:
+            cmd = cmd + f" --password {self._password}"
+        if self._enable_tls:
+            cmd = cmd + " --enable-tls"
+        if self._loop:
+            cmd += " --loop"
+        if self._max_msgs is not None:
+            cmd += f" --seq_read_msgs {self._max_msgs}"
+        if self._max_throughput_mb is not None:
+            cmd += f" --consume-throughput-mb {self._max_throughput_mb}"
+        if self._continuous:
+            cmd += " --continuous"
+        if self._tolerate_data_loss:
+            cmd += " --tolerate-data-loss"
+        if self._group_name is not None:
+            cmd += f" --consumer_group_name {self._group_name}"
+        if self._max_uncommitted is not None:
+            cmd += f" --max-uncommitted {self._max_uncommitted}"
+        if self._use_transactions:
+            cmd += " --use-transactions"
+        if self._compacted:
+            cmd += " --compacted"
+        if self._validate_latest_values:
+            cmd += " --validate-latest-values"
+
+        self.spawn(cmd, node)
+
+        self._status_thread = StatusThread(self, node, ConsumerStatus)
+        self._status_thread.start()
+
+
+class ProduceStatus:
+    def __init__(
+        self,
+        topic: Topic,
+        sent=0,
+        acked=0,
+        bad_offsets=0,
+        max_offsets_produced=dict(),
+        restarts=0,
+        latency=None,
+        active=False,
+        failed_transactions=0,
+        aborted_transaction_msgs=0,
+        fails=0,
+        tombstones_produced=0,
+    ):
+        self.topic = topic
+        self.sent = sent
+        self.acked = acked
+        self.bad_offsets = bad_offsets
+        self.max_offsets_produced = max_offsets_produced
+        self.restarts = restarts
+        if latency is None:
+            latency = {"p50": 0, "p90": 0, "p99": 0}
+        self.latency = latency
+        self.active = active
+        self.failed_transactions = failed_transactions
+        self.aborted_transaction_messages = aborted_transaction_msgs
+        self.fails = fails
+        self.tombstones_produced = tombstones_produced
+
+    def __str__(self):
+        l = self.latency
+        return f"ProduceStatus<{self.topic}: {self.sent} {self.acked} {self.bad_offsets} {self.restarts} {self.failed_transactions} {self.aborted_transaction_messages} {self.fails} {self.tombstones_produced} {l['p50']}/{l['p90']}/{l['p99']}>"
+
+
+Status: TypeAlias = ProduceStatus | ConsumerStatus
+
+
+class KgoVerifierMultiService(Service):
+    def __init__(
+        self,
+        context: TestContext,
+        redpanda: RedpandaServiceForClients,
+        topics: Sequence[KgoVerifierParams],
+        services: Sequence[KgoVerifierService],
+        custom_node: list[ClusterNode] | None = None,
+    ):
+        self.use_custom_node = custom_node is not None
+
+        # We should pass num_nodes to allocate for our service in BackgroundThreadService,
+        # but if user allocate node by themself, BackgroundThreadService should not allocate any nodes
+        nodes_for_allocate = 1
+        if self.use_custom_node:
+            nodes_for_allocate = 0
+
+        super().__init__(context, num_nodes=nodes_for_allocate)
+
+        self._redpanda = redpanda
+
+        # Should check that BackgroundThreadService did not allocate anything
+        # and store allocated nodes by user to self.nodes
+        if self.use_custom_node:
+            assert not self.nodes
+            assert custom_node is not None
+            self.nodes = custom_node
+
+        self._topics: Sequence[Topic] = [t.topic for t in topics]
+        self._services: Sequence[KgoVerifierService] = services
+
+    def _assign_node(
+        self, t: KgoVerifierParams, i: int, nodes: list[ClusterNode] | None
+    ) -> list[ClusterNode] | None:
+        if t.node is not None:
+            return [t.node]
+        elif nodes is None:
+            return None
+        return [nodes[i % len(nodes)]]
+
+    def _assigned_services(self, node: ClusterNode) -> Sequence[KgoVerifierService]:
+        return [
+            svc for svc in self._services if node.name in [n.name for n in svc.nodes]
+        ]
+
+    def start_node(self, node: ClusterNode, clean: bool = False, **kwargs: Any) -> None:
+        if clean:
+            self.clean_node(node, **kwargs)
+        for s in self._assigned_services(node):
+            self._redpanda.logger.info(
+                f"Starting kgo-verifier service for '{s._topic}' on {node.name}"
+            )
+            s.start_node(node, clean=False, **kwargs)
+
+    def wait_node(self, node: ClusterNode, timeout_sec: float | None = None) -> Any:
+        return all(
+            s.wait_node(node, timeout_sec) for s in self._assigned_services(node)
+        )
+
+    def stop_node(self, node: ClusterNode, **kwargs: Any) -> None:
+        for s in self._assigned_services(node):
+            s.stop_node(node, **kwargs)
+
+    def clean_node(self, node: ClusterNode, **kwargs: Any) -> None:
+        self._redpanda.logger.info(f"{self.__class__.__name__}.clean_node")
+        node.account.kill_process("kgo-verifier", clean_shutdown=False)
+        node.account.remove("valid_offsets*json", True)
+        node.account.remove("latest_value*json", True)
+        for s in self._assigned_services(node):
+            node.account.remove(s.log_path, True)
+
+
+class KgoVerifierMultiProducer(KgoVerifierMultiService):
+    def __init__(
+        self,
+        context: TestContext,
+        redpanda: RedpandaServiceForClients,
+        topics: Sequence[KgoVerifierParams],
+        custom_node: list[ClusterNode] | None = None,
+        validate_latest_values: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        enable_tls: bool = False,
+        debug_logs: bool = False,
+        trace_logs: bool = False,
+    ):
+        producers = [
+            KgoVerifierProducer(
+                context,
+                redpanda,
+                topic.topic,
+                topic.msg_size,
+                topic.msg_count,
+                custom_node=self._assign_node(topic, i, custom_node),
+                batch_max_bytes=topic.batch_max_bytes,
+                fake_timestamp_ms=topic.fake_timestamp_ms,
+                fake_timestamp_step_ms=topic.fake_timestamp_step_ms,
+                use_transactions=topic.use_transactions,
+                transaction_timeout_ms=topic.transaction_timeout_ms,
+                transaction_abort_rate=topic.transaction_abort_rate,
+                msgs_per_transaction=topic.msgs_per_transaction,
+                rate_limit_bps=topic.rate_limit_bps,
+                key_set_cardinality=topic.key_set_cardinality,
+                msgs_per_producer_id=topic.msgs_per_producer_id,
+                max_buffered_records=topic.max_buffered_records,
+                tolerate_data_loss=topic.tolerate_data_loss,
+                tolerate_failed_produce=topic.tolerate_failed_produce,
+                tombstone_probability=topic.tombstone_probability,
+                validate_latest_values=validate_latest_values,
+                client_name=topic.client_name,
+                wait_for_acks=topic.wait_for_acks,
+                username=username,
+                password=password,
+                enable_tls=enable_tls,
+                debug_logs=debug_logs,
+                trace_logs=trace_logs,
+            )
+            for i, topic in enumerate(topics)
+        ]
+        super().__init__(context, redpanda, topics, producers, custom_node)
+
+    @property
+    def producers(self) -> Sequence[KgoVerifierProducer]:
+        assert all(isinstance(s, KgoVerifierProducer) for s in self._services)
+        return cast(Sequence[KgoVerifierProducer], self._services)
+
+    def wait_for_acks(
+        self,
+        counts: list[int | None],
+        timeout_sec: float,
+        backoff_sec: float,
+        progress_sec: float | None = None,
+    ) -> None:
+        assert len(counts) == len(self.producers), (
+            f"Mismatch {counts=} vs {len(self.producers)}"
+        )
+        for p, c in zip(self.producers, counts):
+            count = c if c is not None else p._msg_count
+            p.wait_for_acks(count, timeout_sec, backoff_sec, progress_sec)
+
+    def wait_for_offset_map(self) -> None:
+        for p in self.producers:
+            p.wait_for_offset_map()
+
+    def wait_for_latest_value_map(self) -> None:
+        for p in self.producers:
+            p.wait_for_latest_value_map()
+
+
+class KgoVerifierMultiSeqConsumer(KgoVerifierMultiService):
+    def __init__(
+        self,
+        context: TestContext,
+        redpanda: RedpandaServiceForClients,
+        topics: Sequence[KgoVerifierParams],
+        producer: KgoVerifierMultiProducer,
+        custom_node: list[ClusterNode] | None = None,
+        loop: bool = True,
+        continuous: bool = False,
+        username: str | None = None,
+        password: str | None = None,
+        enable_tls: bool = False,
+        debug_logs: bool = False,
+        trace_logs: bool = False,
+        validate_latest_values: bool = False,
+    ):
+        consumers = [
+            KgoVerifierSeqConsumer(
+                context,
+                redpanda,
+                topic.topic,
+                max_msgs=topic.seq_max_msgs,
+                nodes=self._assign_node(topic, i, custom_node),
+                producer=producer.producers[i],
+                max_throughput_mb=topic.consume_throughput_mb,
+                loop=loop,
+                continuous=continuous,
+                tolerate_data_loss=topic.tolerate_data_loss,
+                use_transactions=topic.use_transactions,
+                compacted=topic.compacted,
+                validate_latest_values=validate_latest_values,
+                username=username,
+                password=password,
+                enable_tls=enable_tls,
+                debug_logs=debug_logs,
+                trace_logs=trace_logs,
+            )
+            for i, topic in enumerate(topics)
+        ]
+
+        super().__init__(context, redpanda, topics, consumers, custom_node=custom_node)
+
+
+class KgoVerifierMultiRandomConsumer(KgoVerifierMultiService):
+    def __init__(
+        self,
+        context: TestContext,
+        redpanda: RedpandaServiceForClients,
+        topics: Sequence[KgoVerifierParams],
+        rand_read_msgs: int,
+        parallel: int,
+        custom_node: list[ClusterNode] | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        enable_tls: bool = False,
+        debug_logs: bool = False,
+        trace_logs: bool = False,
+    ):
+        consumers = [
+            KgoVerifierRandomConsumer(
+                context,
+                redpanda,
+                topic.topic,
+                0,  # msg_size unused
+                rand_read_msgs,
+                parallel,
+                use_transactions=topic.use_transactions,
+                nodes=self._assign_node(topic, i, custom_node),
+                username=username,
+                password=password,
+                enable_tls=enable_tls,
+                debug_logs=debug_logs,
+                trace_logs=trace_logs,
+            )
+            for i, topic in enumerate(topics)
+        ]
+
+        super().__init__(context, redpanda, topics, consumers, custom_node=custom_node)
+
+
+class KgoVerifierMultiConsumerGroupConsumer(KgoVerifierMultiService):
+    def __init__(
+        self,
+        context: TestContext,
+        redpanda: RedpandaServiceForClients,
+        topics: Sequence[KgoVerifierParams],
+        readers: int = 1,
+        loop: bool = False,
+        continuous: bool = False,
+        validate_latest_values: bool = False,
+        custom_node: list[ClusterNode] | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        enable_tls: bool = False,
+        debug_logs: bool = False,
+        trace_logs: bool = False,
+    ):
+        consumers = [
+            KgoVerifierConsumerGroupConsumer(
+                context,
+                redpanda,
+                topic.topic,
+                msg_size=0,  # msg_size unused
+                readers=readers,
+                loop=loop,
+                max_msgs=topic.seq_max_msgs,
+                max_throughput_mb=topic.consume_throughput_mb,
+                continuous=continuous,
+                tolerate_data_loss=topic.tolerate_data_loss,
+                group_name=topic.group_name,
+                max_uncommitted=topic.max_uncommitted,
+                use_transactions=topic.use_transactions,
+                compacted=topic.compacted,
+                validate_latest_values=validate_latest_values,
+                nodes=self._assign_node(topic, i, custom_node),
+                username=username,
+                password=password,
+                enable_tls=enable_tls,
+                debug_logs=debug_logs,
+                trace_logs=trace_logs,
+            )
+            for i, topic in enumerate(topics)
+        ]
+
+        super().__init__(context, redpanda, topics, consumers, custom_node=custom_node)
+
+    @property
+    def consumers(self) -> Sequence[KgoVerifierConsumerGroupConsumer]:
+        assert all(
+            isinstance(s, KgoVerifierConsumerGroupConsumer) for s in self._services
+        )
+        return cast(Sequence[KgoVerifierConsumerGroupConsumer], self._services)

@@ -1,0 +1,20 @@
+---
+name: lint-yaml
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.yamllint'
+      - '.github/workflows/*.yml'
+  pull_request:
+    paths:
+      - '.yamllint'
+      - '.github/workflows/*.yml'
+  merge_group:
+    types: [checks_requested]
+jobs:
+  yamllint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: yamllint -f github .yamllint .github/workflows/*.yml

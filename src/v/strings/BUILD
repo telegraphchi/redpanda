@@ -1,0 +1,37 @@
+load("//bazel:build.bzl", "redpanda_cc_library")
+
+redpanda_cc_library(
+    name = "utf8",
+    srcs = [
+        "utf8.cc",
+    ],
+    hdrs = [
+        "utf8.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/base",
+        "//src/v/bytes:iobuf",
+        "@boost//:locale",
+        "@utf8proc",
+    ],
+)
+
+redpanda_cc_library(
+    name = "string_switch",
+    hdrs = [
+        "string_switch.h",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+redpanda_cc_library(
+    name = "static_str",
+    hdrs = [
+        "static_str.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@fmt",
+    ],
+)

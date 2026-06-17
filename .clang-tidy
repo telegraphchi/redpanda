@@ -1,0 +1,74 @@
+---
+Checks: >-
+  redpanda-*,
+  clang-diagnostic-*,
+  clang-analyzer-*,
+  cert-*,
+  cppcoreguidelines-*,
+  hicpp-*,
+  modernize-*,
+  performance-*,
+  misc-*,
+  bugprone-*,
+  -modernize-use-trailing-return-type,
+  -modernize-use-nodiscard,
+  -hicpp-named-parameter,
+  -misc-include-cleaner,
+  -clang-analyzer-optin.core.EnumCastOutOfRange,
+  -cppcoreguidelines-avoid-reference-coroutine-parameters
+WarningsAsErrors: >-
+  redpanda-*,
+  bugprone-use-after-move,
+  bugprone-assert-side-effect,
+  bugprone-assignment-in-if-condition,
+  bugprone-dangling-handle,
+  bugprone-sizeof-container,
+  bugprone-stringview-nullptr,
+  bugprone-unused-return-value,
+  bugprone-suspicious-string-compare,
+  misc-unused-using-decls,
+  misc-unused-alias-decls,
+  modernize-redundant-void-arg,
+  performance-implicit-conversion-in-loop,
+  performance-trivially-destructible,
+  performance-no-automatic-move,
+  performance-move-const-arg,
+  bugprone-unused-local-non-trivial-variable
+HeaderFilterRegex: '.*'
+ExcludeHeaderFilterRegex: '(^|/)external/|\.json\.hh$'
+FormatStyle:    file
+CheckOptions:
+  - key:             cert-dcl16-c.NewSuffixes
+    value:           'L;LL;LU;LLU'
+  - key:             cert-oop54-cpp.WarnOnlyIfThisHasSuspiciousField
+    value:           0
+  - key:             cppcoreguidelines-explicit-virtual-functions.IgnoreDestructors
+    value:           1
+  - key:             misc-non-private-member-variables-in-classes.IgnoreClassesWithAllMemberVariablesBeingPublic
+    value:           1
+  - key:             modernize-loop-convert.MaxCopySize
+    value:           16
+  - key:             modernize-loop-convert.MinConfidence
+    value:           reasonable
+  - key:             modernize-pass-by-value.IncludeStyle
+    value:           llvm
+  - key:             modernize-replace-auto-ptr.IncludeStyle
+    value:           llvm
+  - key:             modernize-use-nullptr.NullMacros
+    value:           NULL
+  - key:             readability-identifier-length.IgnoredVariableNames
+    value:           ^it$
+  - key:             readability-identifier-length.IgnoredParameterNames
+    value:           ^(it|a|b)$
+  - key:             readability-uppercase-literal-suffix.NewSuffixes
+    value:           KiB;MiB;GiB;TiB
+  - key:             hicpp-uppercase-literal-suffix.NewSuffixes
+    value:           KiB;MiB;GiB;TiB
+  - key:             performance-unnecessary-value-param.AllowedTypes
+    value:           seastar::shared_ptr;seastar::lw_shared_ptr;
+  - key:             bugprone-unused-local-non-trivial-variable.IncludeTypes
+    value:           ::seastar::future
+  - key:             performance-move-const-arg.CheckTriviallyCopyableMove
+    value:           0
+...
+

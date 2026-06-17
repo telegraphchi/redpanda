@@ -1,0 +1,325 @@
+{
+    "apiVersion": "0.0.1",
+    "swaggerVersion": "1.2",
+    "basePath": "/v1",
+    "resourcePath": "/transactions",
+    "produces": [
+        "application/json"
+    ],
+    "apis": [
+        {
+            "path": "/v1/transactions",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get a list of transactions",
+                    "type": "array",
+                    "items": {
+                        "type": "transaction_summary"
+                    },
+                    "nickname": "get_all_transactions",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/transaction/{transactional_id}/find_coordinator",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get tx coordinator by tx.id",
+                    "type": "find_coordinator_reply",
+                    "nickname": "find_coordinator",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "transactional_id",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/transaction/{transactional_id}/delete_partition",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Delete partition from transaction",
+                    "type": "void",
+                    "nickname": "delete_partition",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "transactional_id",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "namespace",
+                            "in": "query",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "query",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition_id",
+                            "in": "query",
+                            "required": true,
+                            "type": "integer"
+                        },
+                        {
+                            "name": "etag",
+                            "in": "query",
+                            "required": true,
+                            "type": "integer"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/transaction/unsafe_abort_group_transaction/{group_id}",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Unsafely abort a transaction from a group, only for debugging",
+                    "type": "void",
+                    "nickname": "unsafe_abort_group_transaction",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "group_id",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "producer_id",
+                            "in": "query",
+                            "required": true,
+                            "type": "integer"
+                        },
+                        {
+                            "name": "producer_epoch",
+                            "in": "query",
+                            "required": true,
+                            "type": "integer"
+                        },
+                        {
+                            "name": "sequence",
+                            "in": "query",
+                            "required": true,
+                            "type": "integer"
+                        }
+                    ]
+                }
+            ]
+        }
+    ],
+    "models": {
+        "hash_range": {
+            "id": "hash_range",
+            "description": "Hash range",
+            "properties": {
+                "first": {
+                    "type": "long",
+                    "description": "first"
+                },
+                "last": {
+                    "type": "long",
+                    "description": "last"
+                }
+            }
+        },
+        "tx_mapping_entry": {
+            "id": "tx_mapping_entry",
+            "description": "tx_mapping_entry",
+            "properties": {
+                "partition_id": {
+                    "type": "int",
+                    "description": "partition_id"
+                },
+                "hosted_txs": {
+                    "type": "hosted_txs",
+                    "description": "hosted transactions"
+                }
+            }
+        },
+        "ntp": {
+            "id": "ntp",
+            "description": "NTP",
+            "properties": {
+                "ns": {
+                    "type": "string",
+                    "description": "Namespace"
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Topic"
+                },
+                "partition": {
+                    "type": "long",
+                    "description": "Partition id"
+                }
+            }
+        },
+        "find_coordinator_reply": {
+            "id": "find_coordinator_reply",
+            "description": "find_coordinator_reply",
+            "properties": {
+                "coordinator": {
+                    "type": "long",
+                    "description": "node id"
+                },
+                "ntp": {
+                    "type": "ntp",
+                    "description": "NTP"
+                },
+                "ec": {
+                    "type": "long",
+                    "description": "errc"
+                }
+            }
+        },
+        "producer_identity": {
+            "id": "producer_identity",
+            "description": "Producer identity",
+            "properties": {
+                "id": {
+                    "type": "long",
+                    "description": "Producer id"
+                },
+                "epoch": {
+                    "type": "long",
+                    "description": "Producer epoch"
+                }
+            }
+        },
+        "partition": {
+            "id": "partition",
+            "description": "Partition info",
+            "properties": {
+                "ns": {
+                    "type": "string",
+                    "description": "namespace"
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "topic"
+                },
+                "partition_id": {
+                    "type": "long",
+                    "description": "partition"
+                },
+                "etag": {
+                    "type": "long",
+                    "description": "Raft term"
+                }
+            }
+        },
+        "group": {
+            "id": "group",
+            "description": "Group info",
+            "properties": {
+                "group_id": {
+                    "type": "string",
+                    "description": "Group id"
+                },
+                "etag": {
+                    "type": "long",
+                    "description": "Raft term"
+                }
+            }
+        },
+        "transaction_summary": {
+            "id": "transaction_summary",
+            "description": "Transaction summary",
+            "properties": {
+                "transactional_id": {
+                    "type": "string",
+                    "description": "Id of an application executing a transaction"
+                },
+                "pid": {
+                    "type": "producer_identity",
+                    "description": "pid"
+                },
+                "tx_seq": {
+                    "type": "long",
+                    "description": "tx_seq identifues a transactions within a session"
+                },
+                "etag": {
+                    "type": "long",
+                    "description": "Term of a transaction coordinated started a transaction"
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Current status for transaction"
+                },
+                "timeout_ms": {
+                    "type": "long",
+                    "description": "Transaction timeout"
+                },
+                "staleness_ms": {
+                    "type": "long",
+                    "description": "How long transaction does not make progress"
+                },
+                "partitions": {
+                    "type": "array",
+                    "items": {
+                        "type": "partition"
+                    },
+                    "description": "Partitions for transaction"
+                },
+                "groups": {
+                    "type": "array",
+                    "items": {
+                        "type": "group"
+                    },
+                    "description": "Consumer groups for transaction"
+                }
+            }
+        },
+        "hosted_txs": {
+            "id": "hosted_txs",
+            "description": "hosted_txs",
+            "properties": {
+                "excluded_transactions": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "included_transactions": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "hash_ranges": {
+                    "type": "array",
+                    "items": {
+                        "type": "hash_range"
+                    }
+                }
+            }
+        }
+    }
+}

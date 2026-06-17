@@ -1,0 +1,767 @@
+/*
+ * Copyright 2020 Redpanda Data, Inc.
+ *
+ * Use of this software is governed by the Business Source License
+ * included in the file licenses/BSL.md
+ *
+ * As of the Change Date specified in that file, in accordance with
+ * the Business Source License, use of this software will be governed
+ * by the Apache License, Version 2.0
+ */
+
+#pragma once
+
+#include "base/format_to.h"
+#include "model/fundamental.h"
+#include "model/record_batch_reader.h"
+#include "raft/fundamental.h"
+#include "raft/group_configuration.h"
+#include "raft/replicate.h"
+#include "reflection/adl.h"
+#include "serde/rw/bool_class.h"
+#include "serde/rw/envelope.h"
+#include "serde/rw/scalar.h"
+#include "utils/named_type.h"
+#include "utils/to_string.h"
+
+#include <seastar/core/condition-variable.hh>
+#include <seastar/core/scheduling.hh>
+#include <seastar/net/socket_defs.hh>
+#include <seastar/util/bool_class.hh>
+
+#include <boost/range/irange.hpp>
+#include <boost/range/join.hpp>
+
+#include <cstdint>
+
+namespace raft {
+
+using election_success = ss::bool_class<struct election_success_tag>;
+
+struct protocol_metadata
+  : serde::
+      envelope<protocol_metadata, serde::version<2>, serde::compat_version<0>> {
+    group_id group;
+    model::offset commit_index;
+    model::term_id term;
+    model::offset prev_log_index;
+    model::term_id prev_log_term;
+    model::offset last_visible_index;
+    model::offset dirty_offset;
+    // offset delta corresponding to the prev_log_index
+    model::offset_delta prev_log_delta{};
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{group: {}, commit_index: {}, term: {}, prev_log_index: {}, "
+          "prev_log_term: {}, last_visible_index: {}, dirty_offset: {}, "
+          "prev_log_delta: {}}}",
+          group,
+          commit_index,
+          term,
+          prev_log_index,
+          prev_log_term,
+          last_visible_index,
+          dirty_offset,
+          prev_log_delta);
+    }
+
+    friend bool
+    operator==(const protocol_metadata&, const protocol_metadata&) = default;
+
+    auto serde_fields() {
+        return std::tie(
+          group,
+          commit_index,
+          term,
+          prev_log_index,
+          prev_log_term,
+          last_visible_index,
+          dirty_offset,
+          prev_log_delta);
+    }
+};
+
+// The sequence used to track the order of follower append entries request
+using follower_req_seq = named_type<uint64_t, struct follower_req_seq_tag>;
+
+/**
+ * class containing follower statistics, this may be helpful for debugging,
+ * metrics and querying for follower status
+ */
+struct follower_metrics {
+    model::node_id id;
+    bool is_learner;
+    model::offset committed_log_index;
+    model::offset dirty_log_index;
+    model::offset match_index;
+    clock_type::time_point last_heartbeat;
+    bool is_live;
+    bool under_replicated;
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{node_id: {}, is_learner: {}, committed_log_index: {}, "
+          "dirty_log_index: {}, match_index: {}, is_live: {}, "
+          "under_replicated: {}}}",
+          id,
+          is_learner,
+          committed_log_index,
+          dirty_log_index,
+          match_index,
+          is_live,
+          under_replicated);
+    }
+};
+using flush_after_append = ss::bool_class<struct flush_after_append_tag>;
+
+using flush_after_append = ss::bool_class<struct flush_after_append_tag>;
+
+struct append_entries_request
+  : serde::envelope<
+      append_entries_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    // required for the cases where we will set the target node id before
+    // sending request to the node
+    append_entries_request(
+      vnode src,
+      protocol_metadata m,
+      chunked_vector<model::record_batch> r,
+      size_t batches_size,
+      flush_after_append f = flush_after_append::yes) noexcept;
+
+    append_entries_request(
+      vnode src,
+      vnode target,
+      protocol_metadata m,
+      chunked_vector<model::record_batch> r,
+      size_t batches_size,
+      flush_after_append f = flush_after_append::yes) noexcept;
+
+    ~append_entries_request() noexcept = default;
+    append_entries_request(const append_entries_request&) = delete;
+    append_entries_request& operator=(const append_entries_request&) = delete;
+    append_entries_request(append_entries_request&&) noexcept = default;
+    append_entries_request&
+    operator=(append_entries_request&&) noexcept = default;
+
+    raft::group_id target_group() const { return _meta.group; }
+    vnode source_node() const { return _source_node; }
+    vnode target_node() const { return _target_node_id; }
+    void set_target_node(vnode target) { _target_node_id = target; }
+
+    const protocol_metadata& metadata() const { return _meta; }
+    flush_after_append is_flush_required() const { return _flush; }
+
+    chunked_vector<model::record_batch> release_batches() && {
+        return std::move(_batches);
+    }
+
+    chunked_vector<model::record_batch>& batches() { return _batches; }
+
+    const chunked_vector<model::record_batch>& batches() const {
+        return _batches;
+    }
+
+    fmt::iterator format_to(fmt::iterator it) const;
+
+    ss::future<> serde_async_write(iobuf& out);
+
+    static ss::future<append_entries_request>
+    serde_async_direct_read(iobuf_parser&, serde::header);
+    /// Returns a size of batches and append entries request metadata
+    size_t total_size() const { return _total_size; }
+    /// Returns a size of batches only. This does not include the size of append
+    /// entries metadata
+    size_t batches_size() const;
+
+private:
+    vnode _source_node;
+    vnode _target_node_id;
+    protocol_metadata _meta;
+    flush_after_append _flush;
+    chunked_vector<model::record_batch> _batches;
+
+    // not serialized field used for accounting in raft internals
+    size_t _total_size;
+};
+
+class append_entries_request_serde_wrapper
+  : public serde::envelope<
+      append_entries_request_serde_wrapper,
+      serde::version<0>,
+      serde::compat_version<0>> {
+public:
+    append_entries_request_serde_wrapper(append_entries_request req)
+      : _request(std::move(req)) {}
+
+    append_entries_request release() && { return std::move(_request); }
+
+    ss::future<> serde_async_write(iobuf& out);
+
+    static ss::future<append_entries_request_serde_wrapper>
+    serde_async_direct_read(iobuf_parser&, serde::header);
+
+private:
+    append_entries_request _request;
+};
+
+/*
+ * append_entries_reply uses two different types of serialization: when
+ * encoding/decoding directly normal adl/serde per-field serialization is used.
+ * the second type is a custom encoding used by heartbeat_reply for more
+ * efficient encoding of a vectory of append_entries_reply.
+ */
+struct append_entries_reply
+  : serde::envelope<
+      append_entries_reply,
+      serde::version<1>,
+      serde::compat_version<0>> {
+    // node id to validate on receiver
+    vnode target_node_id;
+    /// \brief callee's node_id; work-around for batched heartbeats
+    vnode node_id;
+    group_id group;
+    /// \brief callee's term, for the caller to upate itself
+    model::term_id term;
+    /// \brief The recipient's last log index after it applied changes to
+    /// the log. This is used to speed up finding the correct value for the
+    /// nextIndex with a follower that is far behind a leader
+    model::offset last_flushed_log_index;
+    model::offset last_dirty_log_index;
+    // the last entry base offset used for the recovery speed up, the value is
+    // only valid for not successfull append_entries reply
+    model::offset last_term_base_offset;
+    /// \brief did the rpc succeed or not
+    reply_result result = reply_result::failure;
+
+    // Hint from follower to leader, indicating they are ready for
+    // recovery traffic (false if they may not have enough resources to
+    // handle recovery).
+    // This is true by default to reflect the legacy case, where
+    // older nodes are always ready for recovery.
+    bool may_recover = true;
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{node_id: {}, target_node_id: {}, group: {}, term: {}, "
+          "last_dirty_log_index: {}, last_flushed_log_index: {}, "
+          "last_term_base_offset: {}, result: {}, may_recover: {}}}",
+          node_id,
+          target_node_id,
+          group,
+          term,
+          last_dirty_log_index,
+          last_flushed_log_index,
+          last_term_base_offset,
+          result,
+          may_recover);
+    }
+
+    friend bool operator==(
+      const append_entries_reply&, const append_entries_reply&) = default;
+
+    auto serde_fields() {
+        return std::tie(
+          target_node_id,
+          node_id,
+          group,
+          term,
+          last_flushed_log_index,
+          last_dirty_log_index,
+          last_term_base_offset,
+          result,
+          may_recover);
+    }
+};
+
+struct heartbeat_metadata {
+    protocol_metadata meta;
+    vnode node_id;
+    vnode target_node_id;
+
+    friend bool
+    operator==(const heartbeat_metadata&, const heartbeat_metadata&) = default;
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{node_id: {}, target_node_id: {}, protocol_metadata: {}}}",
+          node_id,
+          target_node_id,
+          meta);
+    }
+};
+
+struct vote_request
+  : serde::envelope<vote_request, serde::version<0>, serde::compat_version<0>> {
+    vnode node_id;
+    // node id to validate on receiver
+    vnode target_node_id;
+
+    group_id group;
+    /// \brief current term
+    model::term_id term;
+    /// \brief used to compare completeness
+    model::offset prev_log_index;
+    model::term_id prev_log_term;
+    /// \brief true if vote triggered by leadership transfer
+    bool leadership_transfer;
+    raft::group_id target_group() const { return group; }
+    vnode source_node() const { return node_id; }
+    vnode target_node() const { return target_node_id; }
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{node_id: {}, target_node_id: {}, group: {}, term: {}, "
+          "prev_log_index: {}, prev_log_term: {}, leadership_xfer: {}}}",
+          node_id,
+          target_node_id,
+          group,
+          term,
+          prev_log_index,
+          prev_log_term,
+          leadership_transfer);
+    }
+
+    friend bool operator==(const vote_request&, const vote_request&) = default;
+
+    auto serde_fields() {
+        return std::tie(
+          node_id,
+          target_node_id,
+          group,
+          term,
+          prev_log_index,
+          prev_log_term,
+          leadership_transfer);
+    }
+};
+
+struct vote_reply
+  : serde::envelope<vote_reply, serde::version<1>, serde::compat_version<0>> {
+    // node id to validate on receiver
+    vnode target_node_id;
+    /// \brief callee's term, for the caller to upate itself
+    model::term_id term;
+
+    /// True if the follower granted the candidate it's vote, false otherwise
+    bool granted = false;
+
+    /// set to true if the caller's log is as up to date as the recipient's
+    /// - extension on raft. see Diego's phd dissertation, section 9.6
+    /// - "Preventing disruptions when a server rejoins the cluster"
+    bool log_ok = false;
+
+    // replying node
+    vnode node_id;
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{term: {}, target_node: {}, vote_granted: {}, log_ok: {}}}",
+          term,
+          target_node_id,
+          granted,
+          log_ok);
+    }
+
+    friend bool operator==(const vote_reply&, const vote_reply&) = default;
+
+    auto serde_fields() {
+        return std::tie(target_node_id, term, granted, log_ok, node_id);
+    }
+};
+
+/// This structure is used by consensus to notify other systems about group
+/// leadership changes.
+struct leadership_status {
+    // Current term
+    model::term_id term;
+    // Group for which leader have changed
+    group_id group;
+    // Empty when there is no known leader in the group
+    std::optional<vnode> current_leader;
+};
+
+struct transfer_leadership_options {
+    std::chrono::milliseconds recovery_timeout;
+};
+
+using offset_translator_delta = named_type<int64_t, struct ot_delta_tag>;
+struct snapshot_metadata {
+    // we start snasphot metadata version at 64 to leave room for configuration
+    // version updates
+    static constexpr int8_t initial_version = 64;
+    static constexpr int8_t current_version = initial_version;
+
+    model::offset last_included_index;
+    model::term_id last_included_term;
+    int8_t version = current_version;
+    group_configuration latest_configuration;
+    ss::lowres_clock::time_point cluster_time;
+    offset_translator_delta log_start_delta;
+    /**
+     * Since snapshot metadata did not include a version field we are going to
+     * use group configuration version field as a indicator of snapshot metadata
+     * version.
+     */
+    static_assert(
+      group_configuration::current_version <= initial_version,
+      "snapshot metadata is based on the assumption that group configuration "
+      "version is equal to 3, please change it accordignly");
+};
+
+struct install_snapshot_request
+  : serde::envelope<
+      install_snapshot_request,
+      serde::version<1>,
+      serde::compat_version<0>> {
+    // node id to validate on receiver
+    vnode target_node_id;
+    // leader’s term
+    model::term_id term;
+    // target group
+    raft::group_id group;
+    // leader id so follower can redirect clients
+    vnode node_id;
+    // the snapshot replaces all entries up through and including this index
+    model::offset last_included_index;
+    // byte offset where chunk is positioned in the snapshot file
+    uint64_t file_offset;
+    // snapshot chunk, raw bytes
+    iobuf chunk;
+    // true if this is the last chunk
+    bool done;
+    // leader dirty offset
+    model::offset dirty_offset;
+
+    raft::group_id target_group() const { return group; }
+    vnode source_node() const { return node_id; }
+    vnode target_node() const { return target_node_id; }
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{term: {}, group: {}, target_node_id: {}, node_id: {}, "
+          "last_included_index: {}, "
+          "file_offset: {}, chunk_size: {}, done: {}, dirty_offset: {}}}",
+          term,
+          group,
+          target_node_id,
+          node_id,
+          last_included_index,
+          file_offset,
+          chunk.size_bytes(),
+          done,
+          dirty_offset);
+    }
+
+    friend bool
+    operator==(const install_snapshot_request&, const install_snapshot_request&)
+      = default;
+
+    auto serde_fields() {
+        return std::tie(
+          target_node_id,
+          term,
+          group,
+          node_id,
+          last_included_index,
+          file_offset,
+          chunk,
+          done,
+          dirty_offset);
+    }
+};
+
+class install_snapshot_request_foreign_wrapper {
+public:
+    using ptr_t = ss::foreign_ptr<std::unique_ptr<install_snapshot_request>>;
+
+    explicit install_snapshot_request_foreign_wrapper(
+      install_snapshot_request&& req)
+      : _ptr(
+          ss::make_foreign(
+            std::make_unique<install_snapshot_request>(std::move(req)))) {}
+
+    install_snapshot_request copy() const {
+        // make copy on target core
+        return install_snapshot_request{
+          .target_node_id = _ptr->target_node_id,
+          .term = _ptr->term,
+          .group = _ptr->group,
+          .node_id = _ptr->node_id,
+          .last_included_index = _ptr->last_included_index,
+          .file_offset = _ptr->file_offset,
+          .chunk = _ptr->chunk.copy(),
+          .done = _ptr->done,
+          .dirty_offset = _ptr->dirty_offset};
+    }
+    raft::group_id target_group() const { return _ptr->target_group(); }
+    vnode target_node() const { return _ptr->target_node_id; }
+
+private:
+    ptr_t _ptr;
+};
+
+struct install_snapshot_reply
+  : serde::envelope<
+      install_snapshot_reply,
+      serde::version<1>,
+      serde::compat_version<0>> {
+    // node id to validate on receiver
+    vnode target_node_id;
+    // current term, for leader to update itself
+    model::term_id term;
+
+    //  The total number of bytes in the snapshot that the follower has
+    //  stored (after applying the request).
+    //  The leader considers the snapshot transfer complete when bytes_stored
+    //  equals the full size of the snapshot. The leader should use bytes_stored
+    //  as the value for byte_offset in the next request (most importantly,
+    //  when a follower reboots, it returns 0 here and the leader starts at
+    //  offset 0 in the next request).
+    uint64_t bytes_stored = 0;
+    // indicates if the request was successfull
+    bool success = false;
+
+    // replying node
+    vnode node_id;
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{term: {}, target_node_id: {}, bytes_stored: {}, success: {}}}",
+          term,
+          target_node_id,
+          bytes_stored,
+          success);
+    }
+
+    friend bool operator==(
+      const install_snapshot_reply&, const install_snapshot_reply&) = default;
+
+    auto serde_fields() {
+        return std::tie(target_node_id, term, bytes_stored, success, node_id);
+    }
+};
+
+/**
+ * Configuration describing snapshot that is going to be taken at current node.
+ */
+struct write_snapshot_cfg {
+    write_snapshot_cfg(model::offset last_included_index, iobuf data)
+      : last_included_index(last_included_index)
+      , data(std::move(data)) {}
+
+    // last applied offset
+    model::offset last_included_index;
+    // snapshot content
+    iobuf data;
+};
+
+struct timeout_now_request
+  : serde::envelope<
+      timeout_now_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    // node id to validate on receiver
+    vnode target_node_id;
+
+    vnode node_id;
+    group_id group;
+    model::term_id term;
+
+    raft::group_id target_group() const { return group; }
+    vnode source_node() const { return node_id; }
+    vnode target_node() const { return target_node_id; }
+
+    friend bool operator==(
+      const timeout_now_request&, const timeout_now_request&) = default;
+
+    auto serde_fields() {
+        return std::tie(target_node_id, node_id, group, term);
+    }
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "target_node_id {} node_id {} group {} term {}",
+          target_node_id,
+          node_id,
+          group,
+          term);
+    }
+};
+
+struct timeout_now_reply
+  : serde::
+      envelope<timeout_now_reply, serde::version<0>, serde::compat_version<0>> {
+    enum class status : uint8_t { success, failure };
+    // node id to validate on receiver
+    vnode target_node_id;
+
+    model::term_id term;
+    status result;
+
+    friend bool
+    operator==(const timeout_now_reply&, const timeout_now_reply&) = default;
+
+    auto serde_fields() { return std::tie(target_node_id, term, result); }
+
+    friend constexpr uint8_t format_as(status s) {
+        return static_cast<uint8_t>(s);
+    }
+
+    fmt::iterator format_to(fmt::iterator it) const;
+};
+
+inline fmt::iterator timeout_now_reply::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it, "target_node_id {} term {} result {}", target_node_id, term, result);
+}
+
+// key types used to store data in key-value store
+enum class metadata_key : int8_t {
+    voted_for = 0,
+    config_map = 1,
+    config_latest_known_offset = 2,
+    last_applied_offset = 3,
+    unique_local_id = 4,
+    config_next_cfg_idx = 5,
+    last
+};
+
+/**
+ * Raft scheduling_config contains Seastar scheduling and IO priority
+ * controlling primitives.
+ */
+struct scheduling_config {
+    scheduling_config(
+      ss::scheduling_group recv_sg, ss::scheduling_group send_sg)
+      : recv_sg(recv_sg)
+      , send_sg(send_sg) {}
+
+    ss::scheduling_group recv_sg;
+    ss::scheduling_group send_sg;
+};
+
+using with_learner_recovery_throttle
+  = ss::bool_class<struct with_recovery_throttle_tag>;
+
+using keep_snapshotted_log = ss::bool_class<struct keep_snapshotted_log_tag>;
+
+// Raft part of the struct that makes starting the partition
+// instance on the destination shard of the x-shard transfer easier.
+struct xshard_transfer_state {
+    // If before the transfer, this partition was the leader, will contain the
+    // corresponding term. It will be used to try to immediately regain the
+    // leadership on the destination shard.
+    std::optional<model::term_id> leader_term;
+};
+
+struct get_compaction_mcco_request
+  : serde::envelope<
+      get_compaction_mcco_request,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{node_id: {}, target_node_id: {}, group: {}}}",
+          node_id,
+          target_node_id,
+          group);
+    }
+
+    auto serde_fields() { return std::tie(node_id, target_node_id, group); }
+
+    raft::group_id target_group() const { return group; }
+    vnode source_node() const { return node_id; }
+    vnode target_node() const { return target_node_id; }
+
+    vnode node_id;
+    vnode target_node_id;
+    raft::group_id group;
+};
+
+struct get_compaction_mcco_reply
+  : serde::envelope<
+      get_compaction_mcco_reply,
+      serde::version<1>,
+      serde::compat_version<0>> {
+    using is_success = ss::bool_class<struct get_compaction_mcco_tag>;
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(it, "mcco: {}, mxfo: {}", mcco, mxfo);
+    }
+
+    auto serde_fields() { return std::tie(mcco, mxfo); }
+
+    std::optional<model::offset> mcco{};
+    std::optional<model::offset> mxfo{};
+};
+
+struct distribute_compaction_mtro_request
+  : serde::envelope<
+      distribute_compaction_mtro_request,
+      serde::version<1>,
+      serde::compat_version<0>> {
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "{{node_id: {}, target_node_id: {}, group: {}, mtro: {}, mxro: {}}}",
+          node_id,
+          target_node_id,
+          group,
+          mtro,
+          mxro);
+    }
+
+    auto serde_fields() {
+        return std::tie(node_id, target_node_id, group, mtro, mxro);
+    }
+
+    raft::group_id target_group() const { return group; }
+    vnode source_node() const { return node_id; }
+    vnode target_node() const { return target_node_id; }
+
+    vnode node_id;
+    vnode target_node_id;
+    raft::group_id group;
+    model::offset mtro{};
+    model::offset mxro{};
+};
+
+struct distribute_compaction_mtro_reply
+  : serde::envelope<
+      distribute_compaction_mtro_reply,
+      serde::version<0>,
+      serde::compat_version<0>> {
+    using is_success = ss::bool_class<struct distribute_compaction_mtro_tag>;
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(it, "success: {}", success);
+    }
+
+    auto serde_fields() { return std::tie(success); }
+
+    is_success success = is_success::no;
+};
+
+} // namespace raft
+
+namespace reflection {
+
+template<>
+struct adl<raft::snapshot_metadata> {
+    void to(iobuf& out, raft::snapshot_metadata&& request);
+    raft::snapshot_metadata from(iobuf_parser& in);
+};
+
+} // namespace reflection

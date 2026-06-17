@@ -1,0 +1,393 @@
+// Copyright 2020 Redpanda Data, Inc.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.md
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0
+
+#include "net/server.h"
+
+#include "base/likely.h"
+#include "base/vlog.h"
+#include "metrics/metrics.h"
+#include "metrics/prometheus_sanitize.h"
+#include "net/connection.h"
+#include "ssx/abort_source.h"
+#include "ssx/future-util.h"
+#include "ssx/semaphore.h"
+#include "ssx/sformat.h"
+
+#include <seastar/core/abort_source.hh>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/loop.hh>
+#include <seastar/core/metrics.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/net/api.hh>
+#include <seastar/util/later.hh>
+
+#include <exception>
+
+namespace net {
+
+server::server(server_configuration c, ss::logger& log)
+  : cfg(std::move(c))
+  , _log(log)
+  , _memory{size_t{static_cast<size_t>(cfg.max_service_memory_per_core)}, "net/server-mem"}
+  , _probe(std::make_unique<server_probe>()) {
+    vlog(
+      _log.info, "Creating net::server for {} with config {}", cfg.name, cfg);
+}
+
+server::server(ss::sharded<server_configuration>* s, ss::logger& log)
+  : server(s->local(), log) {}
+
+server::~server() = default;
+
+void server::start() {
+    if (!cfg.disable_metrics) {
+        setup_metrics();
+        _probe->setup_metrics(_metrics, cfg.name.c_str());
+    }
+
+    if (!cfg.disable_public_metrics) {
+        setup_public_metrics();
+        _probe->setup_public_metrics(_public_metrics, cfg.name.c_str());
+    }
+
+    if (cfg.connection_rate_bindings) {
+        connection_rate_bindings.emplace(cfg.connection_rate_bindings.value());
+
+        connection_rate_info info{
+          .max_connection_rate
+          = connection_rate_bindings.value().config_general_rate(),
+          .overrides
+          = connection_rate_bindings.value().config_overrides_rate()};
+
+        _connection_rates.emplace(std::move(info), _conn_gate, *_probe);
+
+        connection_rate_bindings.value().config_general_rate.watch([this] {
+            _connection_rates->update_general_rate(
+              connection_rate_bindings.value().config_general_rate());
+        });
+        connection_rate_bindings.value().config_overrides_rate.watch([this] {
+            _connection_rates->update_overrides_rate(
+              connection_rate_bindings.value().config_overrides_rate());
+        });
+    }
+    for (const auto& endpoint : cfg.addrs) {
+        ss::server_socket ss;
+        bool tls_enabled = bool(endpoint.credentials);
+        try {
+            ss::listen_options lo;
+            lo.reuse_address = true;
+            lo.lba = cfg.load_balancing_algo;
+            if (cfg.listen_backlog.has_value()) {
+                lo.listen_backlog = cfg.listen_backlog.value();
+            }
+            lo.so_rcvbuf = cfg.tcp_recv_buf;
+            lo.so_sndbuf = cfg.tcp_send_buf;
+
+            if (!endpoint.credentials) {
+                ss = ss::engine().listen(endpoint.addr, lo);
+            } else {
+                ss = ss::tls::listen(
+                  endpoint.credentials, ss::engine().listen(endpoint.addr, lo));
+            }
+        } catch (...) {
+            throw std::runtime_error(
+              fmt::format(
+                "{} - Error attempting to listen on {}: {}",
+                name(),
+                endpoint,
+                std::current_exception()));
+        }
+        auto& b = _listeners.emplace_back(
+          std::make_unique<listener>(
+            endpoint.name, std::move(ss), tls_enabled));
+        listener& ref = *b;
+        // background
+        ssx::spawn_with_gate(
+          _accept_gate, [this, &ref] { return accept(ref); });
+    }
+}
+
+bool is_gate_closed_exception(std::exception_ptr e) {
+    try {
+        if (e) {
+            std::rethrow_exception(e);
+        }
+    } catch (const ss::gate_closed_exception&) {
+        return true;
+    } catch (...) {
+        return false;
+    }
+    __builtin_unreachable();
+}
+
+void server::print_exceptional_future(
+  ss::future<> f, const char* ctx, ss::socket_address address) {
+    if (likely(!f.failed())) {
+        f.ignore_ready_future();
+        return;
+    }
+
+    auto ex = f.get_exception();
+
+    if (unlikely(_conn_gate.is_closed() && is_gate_closed_exception(ex))) {
+        vlog(_log.info, "Shutting down while [{}], gate closed.", ctx);
+        return;
+    }
+
+    auto disconnected = is_disconnect_exception(ex);
+
+    if (!disconnected) {
+        if (is_auth_error(ex)) {
+            vlog(
+              _log.warn,
+              "Authentication Failure[{}] remote address: {} - {}",
+              ctx,
+              address,
+              ex);
+        } else if (is_invalid_character_error(ex)) {
+            /// Invalid character exceptions indicate a misbehaving client and
+            /// should be logged at WARN, not ERROR
+            vlog(
+              _log.warn,
+              "Invalid character encountered[{}] remote address: {} - {}",
+              ctx,
+              address,
+              ex);
+        } else {
+            // Authentication exceptions are logged at WARN, not ERROR, because
+            // they generally point to a misbehaving client rather than a fault
+            // in the server.
+            vlog(
+              _log.error,
+              "Error[{}] remote address: {} - {}",
+              ctx,
+              address,
+              ex);
+        }
+    } else {
+        vlog(
+          _log.info,
+          "Disconnected {} ({}, {})",
+          address,
+          ctx,
+          disconnected.value());
+    }
+}
+
+ss::future<> server::apply_proto(
+  ss::lw_shared_ptr<net::connection> conn, conn_quota::units cq_units) {
+    return apply(conn)
+      .then_wrapped(
+        [this, conn, cq_units = std::move(cq_units)](ss::future<> f) {
+            print_exceptional_future(
+              std::move(f), "applying protocol", conn->addr);
+            vlog(_log.trace, "shutting down connection {}", conn->addr);
+            return conn->shutdown().then_wrapped(
+              [this, addr = conn->addr](ss::future<> f) {
+                  print_exceptional_future(std::move(f), "shutting down", addr);
+              });
+        })
+      .finally([conn] {});
+}
+
+ss::future<> server::accept(listener& s) {
+    return ss::repeat([this, &s]() mutable {
+        return s.socket.accept().then_wrapped(
+          [this, &s](ss::future<ss::accept_result> f_cs_sa) {
+              return accept_finish(s.name, std::move(f_cs_sa), s.tls_enabled);
+          });
+    });
+}
+
+ss::future<ss::stop_iteration> server::accept_finish(
+  ss::sstring name, ss::future<ss::accept_result> f_cs_sa, bool tls_enabled) {
+    if (_as.abort_requested()) {
+        f_cs_sa.ignore_ready_future();
+        co_return ss::stop_iteration::yes;
+    }
+    auto ar = f_cs_sa.get();
+    ar.connection.set_nodelay(true);
+    ar.connection.set_keepalive(true);
+
+    if (cfg.tcp_keepalive_bindings.has_value()) {
+        ar.connection.set_keepalive_parameters(
+          seastar::net::tcp_keepalive_params{
+            .idle = cfg.tcp_keepalive_bindings->keepalive_idle_time(),
+            .interval = cfg.tcp_keepalive_bindings->keepalive_interval(),
+            .count = cfg.tcp_keepalive_bindings->keepalive_probes(),
+          });
+    }
+
+    conn_quota::units cq_units;
+    if (cfg.conn_quotas) {
+        cq_units = co_await cfg.conn_quotas->get().local().get(
+          ar.remote_address.addr());
+        if (!cq_units.live()) {
+            // Connection limit hit, drop this connection.
+            _probe->connection_rejected_open_limit();
+            vlog(
+              _log.warn,
+              "Open connection limit reached, rejecting {}",
+              ar.remote_address);
+            co_return ss::stop_iteration::no;
+        }
+    }
+
+    if (_connection_rates) {
+        try {
+            co_await _connection_rates->maybe_wait(ar.remote_address.addr());
+        } catch (const std::exception& e) {
+            vlog(
+              _log.trace,
+              "Connection rate limit reached and no token available after "
+              "wait, rejecting {}",
+              ar.remote_address);
+            _probe->connection_rejected_rate_limit();
+            co_return ss::stop_iteration::no;
+        }
+    }
+
+    auto conn = ss::make_lw_shared<net::connection>(
+      _connections,
+      name,
+      std::move(ar.connection),
+      ar.remote_address,
+      *_probe,
+      cfg.stream_recv_buf,
+      tls_enabled,
+      &_log);
+    vlog(
+      _log.trace,
+      "{} - Incoming connection from {} on \"{}\"",
+      this->name(),
+      ar.remote_address,
+      name);
+
+    _as.check();
+    ssx::spawn_with_gate(
+      _conn_gate, [this, conn, cq_units = std::move(cq_units)]() mutable {
+          return apply_proto(conn, std::move(cq_units));
+      });
+    co_return ss::stop_iteration::no;
+}
+
+ss::future<> server::shutdown_input() {
+    vlog(_log.info, "{} - Stopping {} listeners", name(), _listeners.size());
+    for (auto& l : _listeners) {
+        l->socket.abort_accept();
+    }
+    _as.request_abort_ex(ssx::shutdown_requested_exception{});
+
+    return _accept_gate.close().then([this] {
+        vlog(
+          _log.info,
+          "{} - Shutting down {} connections",
+          name(),
+          _connections.size());
+        // close the connections and wait for all dispatches to finish
+        for (auto& c : _connections) {
+            c.shutdown_input();
+        }
+    });
+}
+
+ss::future<> server::wait_for_shutdown() {
+    if (!_as.abort_requested()) {
+        co_await shutdown_input();
+    }
+
+    if (_connection_rates.has_value()) {
+        _connection_rates->stop();
+    }
+
+    co_return co_await _conn_gate.close().then([this] {
+        return seastar::do_for_each(
+          _connections, [](net::connection& c) { return c.shutdown(); });
+    });
+}
+
+ss::future<> server::stop() {
+    // if shutdown input was already requested this method is nop, user has to
+    // wait explicitly for shutdown to finish with `wait_for_shutdown`
+    if (_as.abort_requested()) {
+        return ss::now();
+    }
+    // if shutdown_input wasn't called fallback to previous behavior i.e. stop()
+    // waits for shutdown
+    return wait_for_shutdown();
+}
+
+void server::setup_metrics() {
+    namespace sm = ss::metrics;
+    _metrics.add_group(
+      prometheus_sanitize::metrics_name(cfg.name),
+      {sm::make_total_bytes(
+         "max_service_mem_bytes",
+         [this] { return cfg.max_service_memory_per_core; },
+         sm::description(
+           ssx::sformat("{}: Maximum memory allowed for RPC", cfg.name))),
+       sm::make_total_bytes(
+         "consumed_mem_bytes",
+         [this] { return cfg.max_service_memory_per_core - _memory.current(); },
+         sm::description(
+           ssx::sformat(
+             "{}: Memory consumed by request processing", cfg.name))),
+       sm::make_histogram(
+         "dispatch_handler_latency",
+         [this] { return _hist.internal_histogram_logform(); },
+         sm::description(ssx::sformat("{}: Latency ", cfg.name)))});
+}
+
+void server::setup_public_metrics() {
+    namespace sm = ss::metrics;
+
+    std::string_view server_name(cfg.name);
+
+    if (server_name.ends_with("_rpc")) {
+        server_name.remove_suffix(4);
+    }
+
+    auto server_label = metrics::make_namespaced_label("server");
+
+    _public_metrics.add_group(
+      prometheus_sanitize::metrics_name("rpc:request"),
+      {sm::make_histogram(
+         "latency_seconds",
+         sm::description("RPC latency"),
+         {server_label(server_name)},
+         [this] { return _hist.public_histogram_logform(); })
+         .aggregate({sm::shard_label})});
+}
+
+fmt::iterator server_configuration::format_to(fmt::iterator it) const {
+    it = fmt::format_to(it, "{{");
+    for (auto& a : addrs) {
+        it = fmt::format_to(it, "{}", a);
+    }
+    return fmt::format_to(
+      it,
+      ", max_service_memory_per_core: {}, metrics_enabled:{}"
+      ", listen_backlog:{}, tcp_recv_buf:{}, tcp_send_buf:{}"
+      ", stream_recv_buf:{}}}",
+      max_service_memory_per_core,
+      !disable_metrics,
+      listen_backlog,
+      tcp_recv_buf,
+      tcp_send_buf,
+      stream_recv_buf);
+}
+
+fmt::iterator server_endpoint::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it, "{{{}://{}:{}}}", name, addr, credentials ? "SECURED" : "PLAINTEXT");
+}
+
+} // namespace net

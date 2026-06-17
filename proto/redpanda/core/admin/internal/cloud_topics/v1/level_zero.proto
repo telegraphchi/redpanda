@@ -1,0 +1,191 @@
+// Copyright 2026 Redpanda Data, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package redpanda.core.admin.internal.cloud_topics.v1;
+
+import "proto/redpanda/core/pbgen/options.proto";
+import "proto/redpanda/core/pbgen/rpc.proto";
+import "proto/redpanda/core/common/v1/ntp.proto";
+
+option (pbgen.cpp_namespace) = "proto::admin::level_zero";
+
+// Admin endpoints to query Level-0 garbage collection workers for Cloud Topics.
+
+service LevelZeroService {
+    // Returns GC worker status for each shard on specified node (if present) or
+    // whole cluster.
+    rpc GetStatus(GetStatusRequest) returns (GetStatusResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER
+        };
+    }
+
+    // Starts GC workers on a specific node.
+    rpc StartGc(StartGcRequest) returns (StartGcResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER
+        };
+    }
+
+    // Pauses GC workers on a specific node.
+    rpc PauseGc(PauseGcRequest) returns (PauseGcResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER
+        };
+    }
+
+    // Resets GC worker internal state on the specified node.
+    // Drains in-flight operations and clears iteration state.
+    // GC resumes automatically if it was running before the reset.
+    rpc ResetGc(ResetGcRequest) returns (ResetGcResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER
+        };
+    }
+
+    // Advance a cloud topic partition to the current cluster epoch.
+    rpc AdvanceEpoch(AdvanceEpochRequest) returns (AdvanceEpochResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER
+        };
+    }
+
+    // Query epoch state for one or more cloud topic partitions.
+    rpc GetEpochInfo(GetEpochInfoRequest) returns (GetEpochInfoResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER
+        };
+    }
+
+    // Returns the estimated L0 data size for a cloud topic partition.
+    rpc GetSizeEstimate(GetSizeEstimateRequest)
+        returns (GetSizeEstimateResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER
+        };
+    }
+}
+
+// Request to query GC worker status.
+message GetStatusRequest {
+    // Target a specific node, or omit to query all nodes in the cluster.
+    optional int32 node_id = 1;
+}
+
+// Aggregated status from one or more nodes.
+message GetStatusResponse {
+    repeated NodeStatus nodes = 1;
+}
+
+// GC status for all shards on a single node.
+message NodeStatus {
+    int32 node_id = 1;
+    // One entry per shard on this node.
+    repeated ShardStatus shards = 2;
+    // Set if the node could not be reached or returned an error.
+    optional string error = 3;
+}
+
+// Status of the GC worker on a single shard.
+message ShardStatus {
+    int32 shard_id = 1;
+    Status status = 2;
+}
+
+// Request to start GC workers on a specific node.
+message StartGcRequest {
+    // Target node. If omitted, the receiving node handles the request.
+    optional int32 node_id = 1;
+}
+
+// Empty on success; RPC error on failure.
+message StartGcResponse {}
+
+// Request to pause GC workers on a specific node.
+message PauseGcRequest {
+    // Target node. If omitted, the receiving node handles the request.
+    optional int32 node_id = 1;
+}
+
+// Empty on success; RPC error on failure.
+message PauseGcResponse {}
+
+// Request to reset GC worker state on a specific node.
+message ResetGcRequest {
+    // Target node. If omitted, the receiving node handles the request.
+    optional int32 node_id = 1;
+}
+
+// Empty on success; RPC error on failure.
+message ResetGcResponse {}
+
+// Request to advance a partition to the current cluster epoch.
+message AdvanceEpochRequest {
+    common.v1.TopicPartition partition = 1;
+    int64 new_epoch = 2;
+}
+
+// Response containing epoch state after a successful advance.
+message AdvanceEpochResponse {
+    EpochInfo epoch = 1;
+}
+
+// Request epoch info for a single partition.
+message GetEpochInfoRequest {
+    common.v1.TopicPartition partition = 1;
+}
+
+// Response with epoch info for the requested partition.
+message GetEpochInfoResponse {
+    EpochInfo epoch = 1;
+}
+
+// Epoch state snapshot for a cloud topic partition.
+message EpochInfo {
+    // Largest epoch no longer referenced by the partition.
+    int64 estimated_inactive_epoch = 1;
+    // Highest epoch applied to the partition STM.
+    int64 max_applied_epoch = 2;
+    // Log offset of the last reconciled record.
+    int64 last_reconciled_log_offset = 3;
+    // Log offset at which max_applied_epoch was set.
+    int64 current_epoch_window_offset = 4;
+}
+
+// GC worker lifecycle states.
+// Maps to cloud_topics::level_zero_gc::state.
+enum Status {
+    L0_GC_STATUS_UNSPECIFIED = 0;
+    L0_GC_STATUS_PAUSED = 1;
+    L0_GC_STATUS_RUNNING = 2;
+    L0_GC_STATUS_STOPPING = 3;
+    L0_GC_STATUS_STOPPED = 4;
+    L0_GC_STATUS_RESETTING = 5;
+    L0_GC_STATUS_SAFETY_BLOCKED = 6;
+}
+
+// Request the L0 size estimate for a single partition.
+message GetSizeEstimateRequest {
+    common.v1.TopicPartition partition = 1;
+}
+
+// Response with the L0 size estimate.
+message GetSizeEstimateResponse {
+    // Estimated bytes of cloud data still active in L0 (not yet reconciled
+    // to L1). This is the value reported by the size estimator after
+    // subtracting data below the last reconciled offset.
+    uint64 active_bytes = 1;
+}

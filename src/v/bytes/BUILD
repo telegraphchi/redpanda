@@ -1,0 +1,130 @@
+load("//bazel:build.bzl", "redpanda_cc_library")
+
+redpanda_cc_library(
+    name = "iobuf",
+    srcs = [
+        "iobuf.cc",
+    ],
+    hdrs = [
+        "details/io_allocation_size.h",
+        "details/io_byte_iterator.h",
+        "details/io_fragment.h",
+        "details/io_iterator_consumer.h",
+        "details/io_placeholder.h",
+        "details/out_of_range.h",
+        "iobuf.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/base",
+        "@fmt",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "bytes",
+    srcs = [
+        "bytes.cc",
+    ],
+    hdrs = [
+        "bytes.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":iobuf",
+        "//src/v/base",
+        "@abseil-cpp//absl/container:inlined_vector",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "hash",
+    hdrs = [
+        "hash.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":iobuf",
+        "//src/v/hashing:xx",
+        "@boost//:container_hash",
+    ],
+)
+
+redpanda_cc_library(
+    name = "random",
+    srcs = [
+        "random.cc",
+    ],
+    hdrs = [
+        "random.h",
+    ],
+    implementation_deps = [
+        "//src/v/random:secure_random",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":bytes",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "iostream",
+    srcs = [
+        "iostream.cc",
+    ],
+    hdrs = [
+        "iostream.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":iobuf",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_library(
+    name = "iobuf_parser",
+    hdrs = [
+        "iobuf_parser.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":bytes",
+        "//src/v/strings:utf8",
+        "//src/v/utils:vint",
+    ],
+)
+
+redpanda_cc_library(
+    name = "streambuf",
+    hdrs = [
+        "streambuf.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":iobuf",
+    ],
+)
+
+redpanda_cc_library(
+    name = "ioarray",
+    srcs = [
+        "ioarray.cc",
+    ],
+    hdrs = [
+        "ioarray.h",
+    ],
+    implementation_deps = [
+        ":iobuf_parser",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":iobuf",
+        "//src/v/base",
+        "@abseil-cpp//absl/container:fixed_array",
+        "@seastar",
+    ],
+)

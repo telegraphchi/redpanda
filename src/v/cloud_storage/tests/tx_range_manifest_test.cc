@@ -1,0 +1,92 @@
+/*
+ * Copyright 2022 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
+
+#include "base/seastarx.h"
+#include "bytes/iobuf.h"
+#include "bytes/iostream.h"
+#include "cloud_storage/tx_range_manifest.h"
+#include "cloud_storage/types.h"
+#include "model/fundamental.h"
+#include "model/record.h"
+
+#include <seastar/testing/thread_test_case.hh>
+
+#include <boost/test/tools/old/interface.hpp>
+#include <boost/test/unit_test.hpp>
+
+#include <iterator>
+
+using namespace cloud_storage;
+
+static remote_segment_path
+  segment_path("abcdef01/kafka/topic/0_1/0-1-v1.log.1");
+static remote_manifest_path
+  manifest_path("abcdef01/kafka/topic/0_1/0-1-v1.log.1.tx");
+
+using tx_range_t = model::tx_range;
+
+template<typename T = int>
+static chunked_vector<T> make_chunked_vector(std::initializer_list<T> in) {
+    chunked_vector<T> ret;
+    std::copy(
+      std::make_move_iterator(in.begin()),
+      std::make_move_iterator(in.end()),
+      std::back_inserter(ret));
+    return ret;
+}
+
+static auto ranges = {
+  tx_range_t{
+    model::producer_identity(1, 2),
+    model::offset(3),
+    model::offset(5),
+  },
+  tx_range_t{
+    model::producer_identity(2, 3),
+    model::offset(4),
+    model::offset(6),
+  }};
+
+SEASTAR_THREAD_TEST_CASE(manifest_type_tx) {
+    tx_range_manifest m(segment_path);
+    BOOST_REQUIRE(m.get_manifest_type() == manifest_type::tx_range);
+}
+
+SEASTAR_THREAD_TEST_CASE(create_tx_manifest) {
+    tx_range_manifest m(segment_path);
+    auto path = m.get_manifest_path();
+    BOOST_REQUIRE_EQUAL(path, manifest_path);
+}
+
+SEASTAR_THREAD_TEST_CASE(empty_serialization_roundtrip_test) {
+    tx_range_manifest m(segment_path);
+    auto [is, size] = m.serialize().get();
+    iobuf buf;
+    auto os = make_iobuf_ref_output_stream(buf);
+    ss::copy(is, os).get();
+
+    auto rstr = make_iobuf_input_stream(std::move(buf));
+    tx_range_manifest restored(segment_path);
+    restored.update(std::move(rstr)).get();
+    BOOST_REQUIRE(m == restored);
+}
+
+SEASTAR_THREAD_TEST_CASE(serialization_roundtrip_test) {
+    chunked_vector<tx_range_t> tx_ranges = make_chunked_vector(ranges);
+    tx_range_manifest m(segment_path, std::move(tx_ranges));
+    auto [is, size] = m.serialize().get();
+    iobuf buf;
+    auto os = make_iobuf_ref_output_stream(buf);
+    ss::copy(is, os).get();
+    auto rstr = make_iobuf_input_stream(std::move(buf));
+    tx_range_manifest restored(segment_path);
+    restored.update(std::move(rstr)).get();
+    BOOST_REQUIRE(m == restored);
+}

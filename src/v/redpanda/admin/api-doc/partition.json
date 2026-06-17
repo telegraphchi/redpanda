@@ -1,0 +1,861 @@
+{
+    "apiVersion": "0.0.1",
+    "swaggerVersion": "1.2",
+    "basePath": "/v1",
+    "resourcePath": "/partitions",
+    "produces": [
+        "application/json"
+    ],
+    "apis": [
+        {
+            "path": "/v1/partitions",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get list of partition replicas hosted by current node. (IMPORTANT: this API returns only those partitions which replicas are present on the queried node, not all partitions in the cluster)",
+                    "type": "array",
+                    "items": {
+                        "type": "partition_summary"
+                    },
+                    "nickname": "get_partitions",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/local_summary",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Summarize the status of partitions with a replica on this node",
+                    "type": "partition_local_summary",
+                    "nickname": "get_partitions_local_summary",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/{namespace}/{topic}/{partition}",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get detailed partition information",
+                    "type": "partition",
+                    "nickname": "get_partition",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "namespace",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/{namespace}/{topic}",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get topic partition information",
+                    "type": "array",
+                    "items": {
+                        "type": "partition"
+                    },
+                    "nickname": "get_topic_partitions",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "namespace",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/{namespace}/{topic}/{partition}/replicas",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Update a partitions replicas",
+                    "type": "void",
+                    "nickname": "set_partition_replicas",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "namespace",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/{namespace}/{topic}/{partition}/replicas/{node}",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Update partition replica core",
+                    "type": "void",
+                    "nickname": "set_partition_replica_core",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "namespace",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        },
+                        {
+                            "name": "node",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        },
+                        {
+                            "name": "core",
+                            "in": "body",
+                            "required": "true",
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "core": {
+                                        "type": "number"
+                                    }
+                                },
+                                "required": [
+                                    "core"
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/{namespace}/{topic}/{partition}/transfer_leadership",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Transfer raft group leadership by topic-partition",
+                    "type": "void",
+                    "nickname": "kafka_transfer_leadership",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "namespace",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        },
+                        {
+                            "name": "target",
+                            "in": "query",
+                            "required": false,
+                            "type": "integer"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/{namespace}/{topic}/{partition}/cancel_reconfiguration",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Cancel ongoing partition reconfiguration",
+                    "type": "void",
+                    "nickname": "cancel_partition_reconfiguration",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "namespace",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/reconfigurations",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "List ongoing partition reconfigurations",
+                    "type": "void",
+                    "nickname": "get_partition_reconfigurations",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/rebalance",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Execute on demand partition rebalance",
+                    "type": "void",
+                    "nickname": "trigger_partitions_rebalance",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/rebalance_cores",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Trigger core placement rebalancing for partitions in this broker.",
+                    "type": "void",
+                    "nickname": "trigger_partitions_shard_rebalance",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/{namespace}/{topic}/{partition}/unclean_abort_reconfiguration",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Forcibly abort ongoing partition reconfiguration",
+                    "type": "void",
+                    "nickname": "unclean_abort_partition_reconfiguration",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "namespace",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/{namespace}/{topic}/{partition}/transactions",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get all transactions for partition",
+                    "type": "transactions",
+                    "nickname": "get_transactions",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "namespace",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/{namespace}/{topic}/{partition}/mark_transaction_expired",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Mark transaction expired for partition",
+                    "type": "void",
+                    "nickname": "mark_transaction_expired",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "namespace",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        },
+                        {
+                            "name": "id",
+                            "in": "query",
+                            "required": true,
+                            "type": "integer"
+                        },
+                        {
+                            "name": "epoch",
+                            "in": "query",
+                            "required": true,
+                            "type": "integer"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/majority_lost",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "List of partitions with lost majority given an input set of dead nodes.",
+                    "type": "void",
+                    "nickname": "majority_lost",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "dead_nodes",
+                            "in": "query",
+                            "required": true,
+                            "type": "string"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/partitions/force_recover_from_nodes",
+            "operations": [
+                {
+                    "method": "POST",
+                    "summary": "Force recovers partitions from input list of nodes.",
+                    "type": "void",
+                    "nickname": "force_recover_from_nodes",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/debug/partitions/{topic}/{partition}/offset_for_leader_epoch",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Perform offset_for_leader_epoch on the given Kafka partition and epoch",
+                    "nickname": "offset_for_leader_epoch",
+                    "type": "epoch_and_offset",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "topic",
+                            "in": "path",
+                            "required": true,
+                            "type": "string"
+                        },
+                        {
+                            "name": "partition",
+                            "in": "path",
+                            "required": true,
+                            "type": "integer"
+                        },
+                        {
+                            "name": "epoch",
+                            "in": "query",
+                            "required": true,
+                            "type": "integer"
+                        }
+                    ]
+                }
+            ]
+        }
+    ],
+    "models": {
+        "partition_summary": {
+            "id": "partition_summary",
+            "description": "Partition summary",
+            "properties": {
+                "ns": {
+                    "type": "string",
+                    "description": "namespace"
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "topic"
+                },
+                "partition_id": {
+                    "type": "long",
+                    "description": "partition"
+                },
+                "core": {
+                    "type": "long",
+                    "description": "core"
+                },
+                "materialized": {
+                    "type": "boolean",
+                    "description": "materialized"
+                },
+                "leader": {
+                    "type": "long",
+                    "description": "Latest known leader (or -1 if unknown)"
+                }
+            }
+        },
+        "partitions_local_summary": {
+            "id": "partitions_local_summary",
+            "description": "Summarize status of partitions with a replica on this node",
+            "properties": {
+                "count": {
+                    "type": "long",
+                    "description": "Number of partitions with a replica on this node"
+                },
+                "leaderless": {
+                    "type": "long",
+                    "description": "Number of partitions with a replica on this node that report no known raft leader"
+                },
+                "under_replicated": {
+                    "type": "long",
+                    "description": "Number of partitions with leadership on this node, reporting one or more under-replicated followers"
+                }
+            }
+        },
+        "assignment": {
+            "id": "assignment",
+            "description": "Replica assignment",
+            "properties": {
+                "node_id": {
+                    "type": "long",
+                    "description": "node id"
+                },
+                "core": {
+                    "type": "long",
+                    "description": "core"
+                }
+            }
+        },
+        "partition": {
+            "id": "partition",
+            "description": "Partition details",
+            "properties": {
+                "ns": {
+                    "type": "string",
+                    "description": "namespace"
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "topic"
+                },
+                "partition_id": {
+                    "type": "long",
+                    "description": "partition"
+                },
+                "status": {
+                    "type": "string",
+                    "description": "status"
+                },
+                "leader_id": {
+                    "type": "long",
+                    "description": "leader node id"
+                },
+                "raft_group_id": {
+                    "type": "long",
+                    "description": "partition raft group id"
+                },
+                "replicas": {
+                    "type": "array",
+                    "items": {
+                        "type": "assignment"
+                    },
+                    "description": "Replica assignments"
+                },
+                "disabled": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "producer_identity": {
+            "id": "producer_identity",
+            "description": "Producer identity",
+            "properties": {
+                "id": {
+                    "type": "long",
+                    "description": "Producer id"
+                },
+                "epoch": {
+                    "type": "long",
+                    "description": "Producer epoch"
+                }
+            }
+        },
+        "transaction": {
+            "id": "transaction",
+            "description": "Transaction details",
+            "properties": {
+                "producer_id": {
+                    "type": "producer_identity",
+                    "description": "Producer id"
+                },
+                "lso_bound": {
+                    "type": "long",
+                    "description": "First offset"
+                },
+                "staleness_ms": {
+                    "type": "long",
+                    "description": "How long transaction does not make progress"
+                },
+                "timeout_ms": {
+                    "type": "long",
+                    "description": "Transaction timeout"
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Transaction status"
+                }
+            }
+        },
+        "transactions": {
+            "id": "transactions",
+            "description": "Transactions for current partition",
+            "properties": {
+                "active_transactions": {
+                    "type": "array",
+                    "items": {
+                        "type": "transaction"
+                    },
+                    "description": "Active transactions"
+                },
+                "expired_transactions": {
+                    "type": "array",
+                    "items": {
+                        "type": "transaction"
+                    },
+                    "description": "Expired transactions"
+                }
+            }
+        },
+        "reconfiguration": {
+            "id": "reconfiguration",
+            "description": "Partition reconfiguration details",
+            "properties": {
+                "ns": {
+                    "type": "string",
+                    "description": "Namespace"
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Topic"
+                },
+                "partition": {
+                    "type": "long",
+                    "description": "Partition id"
+                },
+                "previous_replicas": {
+                    "type": "array",
+                    "items": {
+                        "type": "assignment"
+                    },
+                    "description": "Previous replica set"
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Reconfiguration status"
+                },
+                "current_replicas": {
+                    "type": "array",
+                    "items": {
+                        "type": "assignment"
+                    },
+                    "description": "Current replica set"
+                },
+                "bytes_left_to_move": {
+                    "type": "long",
+                    "description": "bytes left to move to new replicas"
+                },
+                "bytes_moved": {
+                    "type": "long",
+                    "description": "bytes already moved to new replicas"
+                },
+                "partition_size": {
+                    "type": "long",
+                    "description": "current size of partition"
+                },
+                "reconciliation_statuses": {
+                    "type": "array",
+                    "items": {
+                        "type": "partition_reconciliation_status"
+                    },
+                    "description": "list of reconciliation statuses per node"
+                },
+                "reconfiguration_policy": {
+                    "type": "string",
+                    "description": "Reconfiguration policy used to perform this update"
+                }
+            }
+        },
+        "partition_reconciliation_status": {
+            "id": "partition_reconciliation_status",
+            "description": "Partition reconciliation status on a node",
+            "properties": {
+                "node_id": {
+                    "type": "int",
+                    "description": "Id of a node reporting the status"
+                },
+                "operations": {
+                    "type": "array",
+                    "items": {
+                        "type": "partition_reconciliation_operation"
+                    },
+                    "description": "list of operations being executed on the node"
+                }
+            }
+        },
+        "partition_reconciliation_operation": {
+            "id": "partition_reconciliation_operation",
+            "description": "Partition reconciliation being executed by a a node on specific shard",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "description": "Type of an operation that is currently being executed"
+                },
+                "core": {
+                    "type": "int",
+                    "description": "Core that the status come from"
+                },
+                "retry_number": {
+                    "type": "int",
+                    "description": "Number of currently executed operations retry"
+                },
+                "revision": {
+                    "type": "int",
+                    "description": "Currently executed operation revision"
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Result of last operation retry"
+                }
+            }
+        },
+        "partition_result": {
+            "id": "partition_result",
+            "description": "Partition result",
+            "properties": {
+                "ns": {
+                    "type": "string",
+                    "description": "Namespace"
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Topic"
+                },
+                "partition": {
+                    "type": "long",
+                    "description": "Partition id"
+                },
+                "result": {
+                    "type": "string",
+                    "description": "Status of operation"
+                }
+            }
+        },
+        "ntp": {
+            "id": "ntp",
+            "description": "Partition metadata",
+            "properties": {
+                "ns": {
+                    "type": "string",
+                    "description": "Namespace"
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Topic"
+                },
+                "partition": {
+                    "type": "long",
+                    "description": "Partition id"
+                }
+            }
+        },
+        "ntp_with_majority_loss": {
+            "id": "ntp_with_majority_loss",
+            "description": "ntp instance with lost majority due to dead nodes.",
+            "properties": {
+                "ntp": {
+                    "type": "ntp",
+                    "description": "partition"
+                },
+                "topic_revision": {
+                    "type": "long",
+                    "description": "Revision of the topic this ntp is a part of."
+                },
+                "replicas": {
+                    "type": "array",
+                    "items": {
+                        "type": "assignment"
+                    },
+                    "description": "Replica assignments"
+                },
+                "dead_nodes": {
+                    "type": "array",
+                    "items": {
+                        "type": "int"
+                    },
+                    "description:": "List of nodes that are dead and contributing to majority loss of partitions."
+                }
+            }
+        },
+        "epoch_and_offset": {
+            "id": "epoch_and_offset",
+            "description": "Result of the offset for leader epoch request",
+            "type": "object",
+            "properties": {
+                "epoch": {
+                    "type": "int",
+                    "description": "The epoch requested"
+                },
+                "current_leader_epoch": {
+                    "type": "int",
+                    "description": "The current leader epoch of the partition"
+                },
+                "end_offset": {
+                    "type": "long",
+                    "description": "The end offset of the partition for the requested epoch"
+                }
+            },
+            "required": [
+                "epoch",
+                "current_leader_epoch",
+                "end_offset"
+            ]
+        }
+    }
+}

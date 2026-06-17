@@ -1,0 +1,456 @@
+/*
+ * Copyright 2022 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
+
+#include "absl/container/btree_map.h"
+#include "base/seastarx.h"
+#include "cloud_storage/segment_meta_cstore.h"
+#include "config/configuration.h"
+#include "model/fundamental.h"
+#include "random/generators.h"
+
+#include <seastar/testing/perf_tests.hh>
+#include <seastar/util/defer.hh>
+
+#include <ranges>
+#include <span>
+#include <vector>
+
+using namespace cloud_storage;
+
+std::vector<segment_meta> generate_metadata(size_t sz) {
+    namespace rg = random_generators;
+    std::vector<segment_meta> manifest;
+    segment_meta curr{
+      .is_compacted = false,
+      .size_bytes = 812,
+      .base_offset = model::offset(0),
+      .committed_offset = model::offset(0),
+      .base_timestamp = model::timestamp(1646430092103),
+      .max_timestamp = model::timestamp(1646430092103),
+      .delta_offset = model::offset_delta(0),
+      .archiver_term = model::term_id(2),
+      .segment_term = model::term_id(0),
+      .delta_offset_end = model::offset_delta(0),
+      .sname_format = segment_name_format::v2,
+    };
+    bool short_segment_run = false;
+    for (size_t i = 0; i < sz; i++) {
+        auto s = curr;
+        manifest.push_back(s);
+        if (short_segment_run) {
+            curr.base_offset = model::next_offset(curr.committed_offset);
+            curr.committed_offset = curr.committed_offset
+                                    + model::offset(rg::get_int(1, 10));
+            curr.size_bytes = rg::get_int(1, 200);
+            curr.base_timestamp = curr.max_timestamp;
+            curr.max_timestamp = model::timestamp(
+              curr.max_timestamp.value() + rg::get_int(0, 1000));
+            curr.delta_offset = curr.delta_offset_end;
+            curr.delta_offset_end = curr.delta_offset_end
+                                    + model::offset_delta(rg::get_int(5));
+            if (rg::get_int(50) == 0) {
+                curr.segment_term = curr.segment_term
+                                    + model::term_id(rg::get_int(1, 20));
+                curr.archiver_term = curr.archiver_term
+                                     + model::term_id(rg::get_int(1, 20));
+            }
+        } else {
+            curr.base_offset = model::next_offset(curr.committed_offset);
+            curr.committed_offset = curr.committed_offset
+                                    + model::offset(rg::get_int(1, 1000));
+            curr.size_bytes = rg::get_int(1, 200000);
+            curr.base_timestamp = curr.max_timestamp;
+            curr.max_timestamp = model::timestamp(
+              curr.max_timestamp.value() + rg::get_int(0, 100000));
+            curr.delta_offset = curr.delta_offset_end;
+            curr.delta_offset_end = curr.delta_offset_end
+                                    + model::offset_delta(rg::get_int(15));
+            if (rg::get_int(50) == 0) {
+                curr.segment_term = curr.segment_term
+                                    + model::term_id(rg::get_int(1, 20));
+                curr.archiver_term = curr.archiver_term
+                                     + model::term_id(rg::get_int(1, 20));
+            }
+        }
+        if (rg::get_int(200) == 0) {
+            short_segment_run = !short_segment_run;
+        }
+    }
+    return manifest;
+}
+
+class baseline_column_store {
+public:
+    using const_iterator
+      = absl::btree_map<model::offset, segment_meta>::const_iterator;
+
+    /// Return iterator
+    const_iterator begin() const { return _data.begin(); }
+
+    const_iterator end() const { return _data.end(); }
+
+    /// Return last segment's metadata (or nullopt if empty)
+    std::optional<segment_meta> last_segment() const {
+        if (_data.empty()) {
+            return std::nullopt;
+        }
+        auto it = _data.end();
+        it = std::prev(it);
+        return it->second;
+    }
+
+    /// Find element and return its iterator
+    const_iterator find(model::offset o) const { return _data.find(o); }
+
+    /// Check if the offset is present
+    bool contains(model::offset o) const { return _data.contains(o); }
+
+    /// Return true if data structure is empty
+    bool empty() const { return _data.empty(); }
+
+    /// Return size of the collection
+    size_t size() const { return _data.size(); }
+
+    /// Upper/lower bound search operations
+    const_iterator upper_bound(model::offset o) const {
+        return _data.upper_bound(o);
+    }
+    const_iterator lower_bound(model::offset o) const {
+        return _data.lower_bound(o);
+    }
+
+    void insert(const segment_meta& meta) { _data[meta.base_offset] = meta; }
+
+    auto to_iobuf() {
+        iobuf buf;
+        serialize(buf, _data.size());
+        for (auto& [k, v] : _data) {
+            serialize(buf, k);
+            serialize(buf, v);
+        }
+        _data.clear();
+        return buf;
+    }
+
+    void from_iobuf(iobuf in) {
+        auto cons = details::io_iterator_consumer{in.begin(), in.end()};
+        auto map_size = deserialize<size_t>(cons);
+        for (auto i = 0u; i < map_size; ++i) {
+            auto k = deserialize<model::offset>(cons);
+            auto v = deserialize<segment_meta>(cons);
+            _data.emplace(k, v);
+        }
+    }
+
+private:
+    static void serialize(iobuf& buf, const auto& v) {
+        auto tmp = std::bit_cast<std::array<uint8_t, sizeof(v)>>(v);
+        buf.append(tmp.data(), tmp.size());
+    }
+
+    template<typename T>
+    static T deserialize(details::io_iterator_consumer& buf) {
+        std::array<uint8_t, sizeof(T)> tmp;
+        buf.consume_to(tmp.size(), tmp.begin());
+        return std::bit_cast<T>(tmp);
+    }
+
+    absl::btree_map<model::offset, segment_meta> _data;
+};
+
+/// Inserts \p items into \p store and, for stores that buffer writes,
+/// flushes the buffer so subsequent operations see the steady-state
+/// compressed layout instead of a partially-buffered one.
+template<class StoreT>
+void populate_store(StoreT& store, std::span<const segment_meta> items) {
+    for (const auto& s : items) {
+        store.insert(s);
+    }
+    if constexpr (requires { store.flush_write_buffer(); }) {
+        store.flush_write_buffer();
+    }
+}
+
+template<class StoreT>
+void cs_append_test(StoreT& store, size_t sz) {
+    auto manifest = generate_metadata(sz);
+    populate_store(store, std::span{manifest}.first(sz - 1));
+
+    perf_tests::start_measuring_time();
+    store.insert(manifest.back());
+    perf_tests::stop_measuring_time();
+}
+
+template<class StoreT>
+void cs_scan_test(StoreT& store, size_t sz) {
+    populate_store(store, generate_metadata(sz));
+
+    perf_tests::start_measuring_time();
+    for (const auto& i : store) {
+        perf_tests::do_not_optimize(i);
+    }
+    perf_tests::stop_measuring_time();
+}
+
+auto last_n(size_t n) {
+    return std::views::reverse | std::views::take(n) | std::views::reverse;
+}
+
+/// Number of lookups executed inside a single timed window for the
+/// find/lower_bound/upper_bound benches. Reported as the per-run op count
+/// so per-op metrics stay comparable across changes.
+constexpr size_t lookup_batch_size = 20;
+
+template<class StoreT>
+size_t cs_find_test(StoreT& store, size_t sz) {
+    auto manifest = generate_metadata(sz);
+    populate_store(store, manifest);
+
+    std::vector<model::offset> keys;
+    keys.reserve(lookup_batch_size);
+    for (auto& e : manifest | last_n(lookup_batch_size)) {
+        keys.push_back(e.base_offset);
+    }
+
+    perf_tests::start_measuring_time();
+    for (auto k : keys) {
+        auto i = store.find(k);
+        perf_tests::do_not_optimize(i);
+    }
+    perf_tests::stop_measuring_time();
+    return keys.size();
+}
+
+template<class StoreT>
+size_t cs_lower_bound_test(StoreT& store, size_t sz) {
+    auto manifest = generate_metadata(sz);
+    populate_store(store, manifest);
+
+    std::vector<model::offset> keys;
+    keys.reserve(lookup_batch_size);
+    for (auto& e : manifest | last_n(lookup_batch_size)) {
+        keys.push_back(e.base_offset + model::offset(1));
+    }
+
+    perf_tests::start_measuring_time();
+    for (auto k : keys) {
+        auto i = store.lower_bound(k);
+        perf_tests::do_not_optimize(i);
+    }
+    perf_tests::stop_measuring_time();
+    return keys.size();
+}
+
+template<class StoreT>
+size_t cs_upper_bound_test(StoreT& store, size_t sz) {
+    auto manifest = generate_metadata(sz);
+    populate_store(store, manifest);
+
+    std::vector<model::offset> keys;
+    keys.reserve(lookup_batch_size);
+    for (auto& e : manifest | last_n(lookup_batch_size)) {
+        keys.push_back(e.base_offset + model::offset(1));
+    }
+
+    perf_tests::start_measuring_time();
+    for (auto k : keys) {
+        auto i = store.upper_bound(k);
+        perf_tests::do_not_optimize(i);
+    }
+    perf_tests::stop_measuring_time();
+    return keys.size();
+}
+
+template<class StoreT>
+void cs_last_segment_test(StoreT& store, size_t sz) {
+    populate_store(store, generate_metadata(sz));
+
+    perf_tests::start_measuring_time();
+    auto s = store.last_segment();
+    perf_tests::do_not_optimize(s);
+    perf_tests::stop_measuring_time();
+}
+
+void cs_serialize_test(auto& store, size_t sz) {
+    populate_store(store, generate_metadata(sz));
+
+    perf_tests::start_measuring_time();
+    auto buf = store.to_iobuf();
+    perf_tests::do_not_optimize(buf);
+    perf_tests::stop_measuring_time();
+}
+
+void cs_deserialize_test(auto& store, size_t sz) {
+    populate_store(store, generate_metadata(sz));
+
+    auto buf = store.to_iobuf();
+    perf_tests::start_measuring_time();
+    store.from_iobuf(std::move(buf));
+    perf_tests::stop_measuring_time();
+}
+
+void cs_iteration_recompute_end_test(auto& store, size_t sz) {
+    populate_store(store, generate_metadata(sz));
+
+    perf_tests::start_measuring_time();
+    for (auto it = store.begin(); it != store.end(); ++it) {
+        auto v = it->size_bytes;
+        perf_tests::do_not_optimize(v);
+    }
+    perf_tests::stop_measuring_time();
+}
+
+void cs_iteration_precompute_end_test(auto& store, size_t sz) {
+    populate_store(store, generate_metadata(sz));
+
+    perf_tests::start_measuring_time();
+    for (auto it = store.begin(), e_it = store.end(); it != e_it; ++it) {
+        auto v = it->size_bytes;
+        perf_tests::do_not_optimize(v);
+    }
+    perf_tests::stop_measuring_time();
+}
+
+PERF_TEST(cstore_bench, column_store_append_baseline) {
+    baseline_column_store store;
+    cs_append_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_append_result) {
+    segment_meta_cstore store;
+    cs_append_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_scan_baseline) {
+    baseline_column_store store;
+    cs_scan_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_scan_result) {
+    segment_meta_cstore store;
+    cs_scan_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_find_baseline) {
+    baseline_column_store store;
+    return cs_find_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_find_result) {
+    segment_meta_cstore store;
+    return cs_find_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_find_no_hints) {
+    segment_meta_cstore store;
+    config::shard_local_cfg().storage_ignore_cstore_hints.set_value(true);
+    auto _ = ss::defer([] {
+        config::shard_local_cfg().storage_ignore_cstore_hints.set_value(false);
+    });
+    return cs_find_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_lower_bound_baseline) {
+    baseline_column_store store;
+    return cs_lower_bound_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_lower_bound_result) {
+    segment_meta_cstore store;
+    return cs_lower_bound_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_upper_bound_baseline) {
+    baseline_column_store store;
+    return cs_upper_bound_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_upper_bound_result) {
+    segment_meta_cstore store;
+    return cs_upper_bound_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_last_segment_baseline) {
+    baseline_column_store store;
+    cs_last_segment_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_last_segment_result) {
+    segment_meta_cstore store;
+    cs_last_segment_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_serialize_baseline) {
+    baseline_column_store store;
+    cs_serialize_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_serialize_result) {
+    segment_meta_cstore store;
+    cs_serialize_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_deserialize_baseline) {
+    baseline_column_store store;
+    cs_deserialize_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, column_store_deserialize_result) {
+    segment_meta_cstore store;
+    cs_deserialize_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, cs_iteration_recompute_end_test_1000) {
+    segment_meta_cstore store;
+    cs_iteration_recompute_end_test(store, 1000);
+}
+
+PERF_TEST(cstore_bench, cs_iteration_recompute_end_test_10000) {
+    segment_meta_cstore store;
+    cs_iteration_recompute_end_test(store, 10000);
+}
+
+PERF_TEST(cstore_bench, cs_iteration_precompute_end_test_1000) {
+    segment_meta_cstore store;
+    cs_iteration_precompute_end_test(store, 1000);
+}
+
+PERF_TEST(cstore_bench, cs_iteration_precompute_end_test_10000) {
+    segment_meta_cstore store;
+    cs_iteration_precompute_end_test(store, 10000);
+}
+
+/// Simulates the `partition_manifest::add()` access pattern: each add
+/// runs `move_aligned_offset_range()` which calls `_segments.lower_bound()`
+/// before the insert lands, flushing the write buffer between every write.
+/// Measures the steady-state cost of appending to a pre-populated cstore.
+void cs_append_with_intervening_lookup_test(
+  size_t pre_populate, size_t append_n) {
+    auto manifest = generate_metadata(pre_populate + append_n);
+
+    segment_meta_cstore store;
+    populate_store(store, std::span{manifest}.first(pre_populate));
+
+    perf_tests::start_measuring_time();
+    for (size_t i = pre_populate; i < pre_populate + append_n; ++i) {
+        auto it = store.lower_bound(manifest[i].base_offset);
+        perf_tests::do_not_optimize(it);
+        store.insert(manifest[i]);
+    }
+    perf_tests::stop_measuring_time();
+}
+
+PERF_TEST(cstore_bench, column_store_append_with_intervening_lookup_10k_1k) {
+    cs_append_with_intervening_lookup_test(10000, 1000);
+}
+
+PERF_TEST(cstore_bench, column_store_append_with_intervening_lookup_100k_1k) {
+    cs_append_with_intervening_lookup_test(100000, 1000);
+}

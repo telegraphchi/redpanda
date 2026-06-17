@@ -1,0 +1,307 @@
+/*
+ * Copyright 2020 Redpanda Data, Inc.
+ *
+ * Use of this software is governed by the Business Source License
+ * included in the file licenses/BSL.md
+ *
+ * As of the Change Date specified in that file, in accordance with
+ * the Business Source License, use of this software will be governed
+ * by the Apache License, Version 2.0
+ */
+
+#pragma once
+
+#include "bytes/iobuf.h"
+#include "container/chunked_circular_buffer.h"
+#include "model/record_batch_reader.h"
+#include "storage/lock_manager.h"
+#include "storage/offset_translator_state.h"
+#include "storage/parser.h"
+#include "storage/probe.h"
+#include "storage/segment.h"
+#include "storage/segment_set.h"
+#include "storage/types.h"
+
+#include <seastar/core/io_queue.hh>
+#include <seastar/util/optimized_optional.hh>
+
+/**
+storage/log_reader: use iterator-style traversal for reading
+
+segment 1                                   segment 2
++--+--+--+--+-----+------+--+--+----+---+   +--+--+--+--+-----+---------+
+|  |  |  |  |     |      |  |  |    |   |   |  |  |  |  |     |         |
++--+--+--+--+-----+---------+--+----+---+   +--+--+--+--+-----+---------+
+^                        ^
+|                        |
+|                        | log_reader::iterator<continous_batch_parser>
+|                        |
+|                        +
+| log_reader::iterator::reader<log_segment_batch_reader>
+|
+|
++ log_reader::iterator::next_seg<segment_set::iterator>
+
+Instead of closing the log_segment_batch_reader which reads _one_ segment
+after every invocation of `record_batch_reader::load_batches()`
+    we keep the pair of iterators around.
+
+    The tradeoff is that we now _must_ close the parser manually
+*/
+namespace storage {
+
+class log_segment_batch_reader;
+class skipping_consumer final : public batch_consumer {
+public:
+    explicit skipping_consumer(
+      log_segment_batch_reader& reader,
+      model::timeout_clock::time_point timeout,
+      std::optional<model::offset> next_cached_batch) noexcept
+      : _reader(reader)
+      , _timeout(timeout)
+      , _next_cached_batch(next_cached_batch) {}
+
+    consume_result
+    accept_batch_start(const model::record_batch_header&) const override;
+
+    void consume_batch_start(
+      model::record_batch_header,
+      size_t physical_base_offset,
+      size_t bytes_on_disk) override;
+
+    void skip_batch_start(
+      model::record_batch_header,
+      size_t physical_base_offset,
+      size_t bytes_on_disk) override;
+    void consume_records(iobuf&&) override;
+    ss::future<stop_parser> consume_batch_end() override;
+    fmt::iterator format_to(fmt::iterator it) const override;
+
+private:
+    log_segment_batch_reader& _reader;
+    model::record_batch_header _header;
+    iobuf _records;
+    model::timeout_clock::time_point _timeout;
+    std::optional<model::offset> _next_cached_batch;
+    model::offset _expected_next_batch;
+};
+
+class log_segment_batch_reader {
+public:
+    static constexpr size_t max_buffer_size
+      = local_log_reader_config::segment_reader_max_buffer_size;
+
+    log_segment_batch_reader(
+      segment&, local_log_reader_config& config, probe& p) noexcept;
+    log_segment_batch_reader(log_segment_batch_reader&&) noexcept = default;
+    log_segment_batch_reader&
+    operator=(log_segment_batch_reader&&) noexcept = delete;
+    log_segment_batch_reader(const log_segment_batch_reader&) = delete;
+    log_segment_batch_reader&
+    operator=(const log_segment_batch_reader&) = delete;
+    ~log_segment_batch_reader() noexcept = default;
+
+    ss::future<result<chunked_circular_buffer<model::record_batch>>>
+      read_some(model::timeout_clock::time_point);
+
+    ss::future<> close();
+
+private:
+    ss::future<std::unique_ptr<continuous_batch_parser>> initialize(
+      model::timeout_clock::time_point,
+      std::optional<model::offset> next_cached_batch);
+
+    void add_one(model::record_batch&&);
+
+private:
+    struct tmp_state {
+        chunked_circular_buffer<model::record_batch> buffer;
+        size_t buffer_size = 0;
+        bool is_full() const { return buffer_size >= max_buffer_size; }
+    };
+
+    segment& _seg;
+    local_log_reader_config& _config;
+    probe& _probe;
+
+    std::unique_ptr<continuous_batch_parser> _iterator;
+    tmp_state _state;
+    friend class skipping_consumer;
+};
+
+class log_reader final : public model::record_batch_reader::impl {
+    friend struct fmt::formatter<log_reader>;
+
+public:
+    using data_t = model::record_batch_reader::data_t;
+    using foreign_data_t = model::record_batch_reader::foreign_data_t;
+    using storage_t = model::record_batch_reader::storage_t;
+    static std::vector<model::record_batch> make_ghost_batches(
+      model::offset start_offset,
+      model::offset end_offset,
+      model::term_id term);
+
+    log_reader(
+      std::unique_ptr<lock_manager::lease>,
+      local_log_reader_config,
+      probe&,
+      ss::lw_shared_ptr<const storage::offset_translator_state>) noexcept;
+
+    ~log_reader() final {
+        vassert(!_iterator.reader, "log reader destroyed with live reader");
+    }
+
+    bool is_end_of_stream() const final {
+        return _iterator.next_seg == _lease->range.end();
+    }
+
+    ss::future<storage_t> do_load_slice(model::timeout_clock::time_point) final;
+
+    virtual std::optional<private_flags> get_flags() const final;
+
+    ss::future<> finally() noexcept final { return _iterator.close(); }
+
+    fmt::iterator format_to(fmt::iterator it) const final {
+        return fmt::format_to(it, "storage::log_reader. config {}", _config);
+    }
+
+    /**
+     * \brief Resets configuration of given reader.
+     *
+     * Resetting reader configuration allow user to reuse reader. When client
+     * request a chunk read it can reuse reader to continue reading given log.
+     *
+     * f.e.
+     * 1. read batches with offsets [0,100]
+     * 2. reset configuration with start_offset = 101
+     * 3. read next chunk of batches
+     *
+     * Resetting a reader also sets its "was cached" attribute to true.
+     */
+    void reset_config(local_log_reader_config cfg);
+
+    /**
+     * Return next read request lower bound. i.e. lowest offset that can be read
+     * using this reader. This way we can match requested offsets with cached
+     * readers.
+     */
+    model::offset next_read_lower_bound() const { return _config.start_offset; }
+
+    /**
+     * Base offset of first locked segment in read lock lease
+     */
+    model::offset lease_range_base_offset() const {
+        if (_lease->range.empty()) {
+            return model::offset{};
+        }
+        return _lease->range.front()->offsets().get_base_offset();
+    }
+    /**
+     * Last offset of last locked segment in read lock lease
+     */
+    model::offset lease_range_end_offset() const {
+        if (_lease->range.empty()) {
+            return model::offset{};
+        }
+        return _lease->range.back()->offsets().get_dirty_offset();
+    }
+
+    /**
+     * Indicates if current reader may be reused for future reads.
+     *
+     * reader reuse is only possible when we have an active reader and we didn't
+     * read all locked segments already
+     */
+    bool is_reusable() const { return _iterator.reader != nullptr; }
+
+private:
+    void set_end_of_stream() { _iterator.next_seg = _lease->range.end(); }
+    bool is_done();
+    ss::future<> find_next_valid_iterator();
+
+private:
+    struct iterator_pair {
+        iterator_pair(
+          segment_set::iterator i,
+          std::unique_ptr<log_segment_batch_reader> reader = nullptr)
+          : next_seg(i)
+          , current_reader_seg(i)
+          , reader{std::move(reader)} {}
+        segment_set::iterator next_seg;
+        segment_set::iterator current_reader_seg;
+        std::unique_ptr<log_segment_batch_reader> reader;
+
+        explicit operator bool() { return bool(reader); }
+        ss::future<> close() {
+            if (reader) {
+                return reader->close().then([this] { reader = nullptr; });
+            }
+            return ss::make_ready_future<>();
+        }
+
+        const auto& offsets() const { return (*next_seg)->offsets(); }
+    };
+
+    ss::future<storage_t> load_slice(model::timeout_clock::time_point);
+    unsigned _load_slice_depth{0};
+    bool log_load_slice_depth_warning() const;
+    void maybe_log_load_slice_depth_warning(std::string_view) const;
+
+    // Reset the internal state of the reader, using the given config and
+    // the given segment set iterator. This method is shared between the
+    // constructor and the reader cache hit path (which calls reset_config()).
+    void reset(local_log_reader_config, iterator_pair, bool cache_hit);
+
+    std::unique_ptr<lock_manager::lease> _lease;
+    iterator_pair _iterator;
+
+    // NOTE: this is not a const config, and is updated to reflect its
+    // progression.
+    local_log_reader_config _config;
+
+    // The base offset of the previous batch processed.
+    model::offset _last_base;
+
+    // true if this reader was returned as a hit from the readers cache
+    bool _was_cached{};
+
+    // The expected next offset to be processed, used to detect and fill gaps.
+    std::optional<model::offset> _expected_next;
+    probe& _probe;
+    ss::abort_source::subscription _as_sub;
+
+    ss::lw_shared_ptr<const storage::offset_translator_state> _translator;
+};
+
+/**
+ * Assuming caller has already determined that this batch contains
+ * the record that should be the result to the timequery (critical!),
+ * traverse the batch to find the record with with timestamp >= \ref t.
+ *
+ * The min and max offsets are used to limit the search to a specific
+ * range inside the batch. This is necessary to support the case where
+ * log was requested to be prefix-truncated (trim-prefix) to an offset
+ * which lies in the middle of a batch.
+ *
+ * If the preconditions aren't met, the result is the timestamp of the first
+ * record in the batch.
+ *
+ * This is used by both storage's disk_log_impl and by cloud_storage's
+ * remote_partition, to seek to their final result after finding
+ * the batch.
+ *
+ * To read more about trim-prefix:
+ * https://docs.redpanda.com/current/reference/rpk/rpk-topic/rpk-topic-trim-prefix/
+ *
+ * \param batch The batch to search in.
+ * \param min_offset The minimum offset to consider
+ * \param t The timestamp to search for
+ * \param max_offset The maximum offset to consider
+ */
+ss::future<timequery_result> batch_timequery(
+  model::record_batch batch,
+  model::offset min_offset,
+  model::timestamp t,
+  model::offset max_offset);
+
+} // namespace storage

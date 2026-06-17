@@ -1,0 +1,76 @@
+# Pre-commit hooks for Redpanda project
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+
+default_language_version:
+  python: python3
+
+repos:
+  # Python formatting and linting
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.12.10
+    hooks:
+      # checked in CI by lint-python.yml
+      - id: ruff-check
+        args: [--fix, --exit-non-zero-on-fix]
+        files: '^tests/.*\.pyi?$'
+      # checked in CI by lint-python.yml
+      - id: ruff-format
+
+  # Shell script formatting
+  - repo: https://github.com/scop/pre-commit-shfmt
+    rev: v3.12.0-2
+    hooks:
+      - id: shfmt
+        # args should be kept in sync with vtools/taskfiles/lint.yml
+        # except that we add -d to provide some feedback about the error
+        args: ['-i', '2', '-ci', '-s', '-w', '-d']
+
+  - repo: https://github.com/golangci/golangci-lint
+    rev: v2.11.4
+    hooks:
+      - id: golangci-lint-full
+        name: Go linting (golangci-lint)
+        entry: bash -c 'cd src/go/rpk && golangci-lint run --timeout=10m --verbose'
+        language_version: 1.26.2
+        files: '^src/go/rpk/.*\.go$|^src/go/rpk/go\.(mod|sum)$|^src/go/rpk/\.golangci\.yml$'
+        pass_filenames: false
+
+      - id: golangci-lint-config-verify
+        name: Go lint config verify
+        entry: bash -c 'cd src/go/rpk && golangci-lint config verify --config .golangci.yml'
+        language_version: 1.26.2
+        files: '^src/go/rpk/\.golangci\.yml$'
+        pass_filenames: false
+
+  # Local hooks
+  - repo: local
+    hooks:
+        # runs python type checking (same as task rp:type-check) but only in
+        # manual mode for now as it's too slow for pre-commit for now
+      - id: python-type-check
+        name: Python type checking (pyright)
+        entry: env TC_DOCKER_ARGS=--quiet tools/type-checking/type-check.sh pre-commit
+        language: system
+        stages: [manual]
+        files: '(tests/rptest/.*\.py$)|(tools/type-checking/.*)'
+
+      - id: clang-format
+        name: C++ formatting (clang-format)
+        entry: ./tools/clang-format -i
+        language: script
+        types_or: [c++, c, proto, java]
+
+      - id: bazel/buildifier
+        name: Bazel formatting
+        entry: bazel run //tools:buildifier.fix
+        language: system
+        files: '^MODULE.bazel$|^BUILD$|/BUILD$|\.(BUILD|bzl)$'
+        pass_filenames: false
+
+      - id: copyright-year
+        name: Copyright year check for new files
+        entry: tools/check-copyright-year.sh
+        language: script
+        files: '\.(cc|h|py|go|java|sh)$'
+        pass_filenames: false

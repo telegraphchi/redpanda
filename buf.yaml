@@ -1,0 +1,39 @@
+# When running buf locally it's important to pass the flag `--paths proto`
+# to the CLI otherwise it will try and scan the entire repo and it will
+# take forever. I'm not sure why `includes` doesn't also do this, but here
+# we are :shrug:
+version: v2
+modules:
+  - name: buf.build/redpandadata/core
+    path: .
+    includes:
+      - proto
+    excludes:
+      - proto/redpanda/core/admin/internal
+      - proto/redpanda/core/testing
+      - proto/redpanda/datalake
+deps:
+  - buf.build/googleapis/googleapis
+lint:
+  use:
+    - STANDARD
+  except:
+    # the proto directory doesn't play well
+    # with the package we use.
+    - PACKAGE_VERSION_SUFFIX
+    - PACKAGE_DIRECTORY_MATCH
+  ignore:
+    - proto/redpanda/core/testing
+  ignore_only:
+    # This is an annotation, we want
+    # it to be easy to write.
+    ENUM_VALUE_PREFIX:
+      - proto/redpanda/core/pbgen
+    ENUM_NO_ALLOW_ALIAS:
+      - proto/redpanda/core/admin/v2/shadow_link.proto
+      - proto/redpanda/core/common/v1/acl.proto
+breaking:
+  use:
+    - FILE
+    - WIRE
+    - WIRE_JSON

@@ -1,0 +1,321 @@
+// Copyright 2020 Redpanda Data, Inc.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.md
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0
+
+#include "pandaproxy/server.h"
+
+#include "model/metadata.h"
+#include "net/dns.h"
+#include "net/tls_certificate_probe.h"
+#include "pandaproxy/default_404_handler.h"
+#include "pandaproxy/json/types.h"
+#include "pandaproxy/logger.h"
+#include "pandaproxy/probe.h"
+#include "pandaproxy/reply.h"
+#include "rpc/rpc_utils.h"
+#include "utils/truncating_logger.h"
+
+#include <seastar/core/coroutine.hh> // NOLINT(misc-include-cleaner): required for co_await/co_return coroutine support
+#include <seastar/http/function_handlers.hh> // NOLINT(misc-include-cleaner): provides ss::httpd::handler_base
+#include <seastar/http/reply.hh>
+#include <seastar/net/tls.hh>
+
+#include <charconv>
+#include <exception>
+#include <memory>
+
+namespace pandaproxy {
+
+namespace {
+void set_mime_type(ss::http::reply& rep, json::serialization_format fmt) {
+    if (fmt != json::serialization_format::none) {
+        rep.set_content_type(ss::sstring(name(fmt)));
+    } else { // TODO(Ben Pope): Remove this branch when endpoints are migrated
+        rep.set_content_type("application/vnd.kafka.binary.v2+json");
+    }
+}
+
+} // namespace
+
+/**
+ * Search for the first header of a given name
+ * @param name the header name
+ * @return a string_view to the header value, if it exists or empty string_view
+ */
+std::string_view
+get_header(const ss::http::request& req, const ss::sstring& name) {
+    auto res = req._headers.find(name);
+    if (res == req._headers.end()) {
+        return std::string_view();
+    }
+    return res->second;
+}
+
+size_t get_request_size(const ss::http::request& req) {
+    const size_t fixed_overhead{1024};
+
+    auto content_length_hdr{get_header(req, "Content-Length")};
+    size_t content_length{0};
+    // Ignore failure, content_length is unchanged
+    std::from_chars(
+      content_length_hdr.data(),
+      content_length_hdr.data() + content_length_hdr.size(),
+      content_length);
+
+    return fixed_overhead + content_length;
+}
+
+// server::function_handler to seastar::httpd::handler
+struct handler_adaptor : ss::httpd::handler_base {
+    handler_adaptor(
+      ss::gate& pending_requests,
+      server::context_t& ctx,
+      server::function_handler&& handler,
+      ss::httpd::path_description& path_desc,
+      const ss::sstring& metrics_group_name,
+      json::serialization_format exceptional_mime_type,
+      ss::logger& log,
+      truncating_logger& req_log)
+      : _pending_requests(pending_requests)
+      , _ctx(ctx)
+      , _handler(std::move(handler))
+      , _probe(path_desc, metrics_group_name)
+      , _exceptional_mime_type(exceptional_mime_type)
+      , _log(log)
+      , _req_log(req_log) {}
+
+    ss::future<std::unique_ptr<ss::http::reply>> handle(
+      const ss::sstring&,
+      std::unique_ptr<ss::http::request> req,
+      std::unique_ptr<ss::http::reply> rep) final {
+        auto measure = _probe.auto_measure();
+        auto guard = ss::gate::holder(_pending_requests);
+        server::request_t rq{std::move(req), this->_ctx};
+        server::reply_t rp{std::move(rep)};
+        const auto set_and_measure_response =
+          [&measure](const server::reply_t& rp) {
+              set_mime_type(*rp.rep, rp.mime_type);
+              measure.set_status(rp.rep->_status);
+          };
+        auto inflight_units = _ctx.inflight_sem.try_get_units(1);
+        if (!inflight_units) {
+            auto er = err_reply_builder{std::move(rp.rep)};
+            er.set_reply_too_many_requests();
+            rp.rep = std::move(er).build();
+            rp.mime_type = _exceptional_mime_type;
+            set_and_measure_response(rp);
+            co_return std::move(rp.rep);
+        }
+        auto req_size = get_request_size(*rq.req);
+        if (req_size > _ctx.max_memory) {
+            auto er = err_reply_builder{std::move(rp.rep)};
+            er.set_reply_payload_too_large();
+            rp.rep = std::move(er).build();
+            rp.mime_type = _exceptional_mime_type;
+            set_and_measure_response(rp);
+            co_return std::move(rp.rep);
+        }
+        auto sem_units = co_await ss::get_units(_ctx.mem_sem, req_size);
+
+        auto prefix = ssx::sformat(
+          "[{}:{}]",
+          rq.req->get_client_address().addr(),
+          rq.req->get_client_address().port());
+        auto req_line = ssx::sformat(
+          "{} {} HTTP/{}", rq.req->_method, rq.req->_url, rq.req->_version);
+        vlog(_log.trace, "{} handling {}", prefix, req_line);
+
+        if (_ctx.as.abort_requested()) {
+            auto er = err_reply_builder{std::move(rp.rep)};
+            er.set_reply_unavailable();
+            rp.rep = std::move(er).build();
+            rp.mime_type = _exceptional_mime_type;
+            set_and_measure_response(rp);
+            co_return std::move(rp.rep);
+        }
+        auto method = rq.req->_method;
+        auto url = rq.req->_url;
+        try {
+            rp = co_await _handler(std::move(rq), std::move(rp));
+        } catch (...) {
+            auto ex = std::current_exception();
+            vlog(
+              _log.warn,
+              "Request: {} {} failed: {:?}",
+              method,
+              url,
+              std::current_exception());
+            auto er = exception_reply(_log, ex);
+            auto& erb = er.get_json_body();
+            if (_req_log.is_enabled(ss::log_level::trace) && erb.has_value()) {
+                iobuf_parser parser{rjson_serialize_iobuf(*erb)};
+                vlog(
+                  _req_log.trace,
+                  "{} sending response {} {}: {:?}",
+                  prefix,
+                  method,
+                  url,
+                  parser.read_string(
+                    std::min(parser.bytes_left(), max_log_line_bytes)));
+            }
+            rp = server::reply_t{std::move(er).build(), _exceptional_mime_type};
+        }
+        set_and_measure_response(rp);
+        vlog(
+          _log.trace,
+          "{} responding to {}: status={} resp_size={}",
+          prefix,
+          req_line,
+          static_cast<std::underlying_type_t<ss::http::reply::status_type>>(
+            rp.rep->_status),
+          rp.rep->_content.size());
+        co_return std::move(rp.rep);
+    }
+
+    ss::gate& _pending_requests;
+    server::context_t& _ctx;
+    server::function_handler _handler;
+    probe _probe;
+    json::serialization_format _exceptional_mime_type;
+    ss::logger& _log;
+    truncating_logger& _req_log;
+};
+
+server::server(
+  const ss::sstring& server_name,
+  const ss::sstring& public_metrics_group_name,
+  ss::httpd::api_registry_builder20&& api20,
+  const ss::sstring& header,
+  const ss::sstring& definitions,
+  context_t& ctx,
+  json::serialization_format exceptional_mime_type,
+  ss::logger& log,
+  truncating_logger& req_log)
+  : _server(server_name)
+  , _public_metrics_group_name(public_metrics_group_name)
+  , _pending_reqs()
+  , _api20(std::move(api20))
+  , _has_routes(false)
+  , _ctx(ctx)
+  , _exceptional_mime_type(exceptional_mime_type)
+  , _probe{}
+  , _log(log)
+  , _req_log(req_log) {
+    _api20.set_api_doc(_server._routes);
+    _api20.register_api_file(_server._routes, header);
+    _api20.add_definitions_file(_server._routes, definitions);
+    _server.set_content_streaming(true);
+    _server.set_keepalive_parameters(
+      ss::net::tcp_keepalive_params{
+        .idle = std::chrono::seconds{120},
+        .interval = std::chrono::seconds{60},
+        .count = 3,
+      });
+}
+
+/*
+ *  the method route register a route handler for the specified endpoint.
+ */
+void server::route(server::route_t r) {
+    // NOTE: this pointer will be owned by data member _routes of
+    // ss::httpd:server. seastar didn't use any unique ptr to express that.
+    auto* handler = new handler_adaptor(
+      _pending_reqs,
+      _ctx,
+      std::move(r.handler),
+      r.path_desc,
+      _public_metrics_group_name,
+      _exceptional_mime_type,
+      _log,
+      _req_log);
+    r.path_desc.set(_server._routes, handler);
+}
+
+void server::routes(server::routes_t&& rts) {
+    // Insert a comma between routes to make the api docs valid JSON.
+    if (_has_routes) {
+        _api20.register_function(
+          _server._routes,
+          [](ss::output_stream<char>& os) { return os.write(",\n"); });
+    } else {
+        _has_routes = true;
+    }
+    _api20.register_api_file(_server._routes, rts.api);
+
+    for (auto& e : rts.routes) {
+        this->route(std::move(e));
+    }
+}
+
+ss::future<> server::start(
+  const std::vector<config::rest_authn_endpoint>& endpoints,
+  const std::vector<config::endpoint_tls_config>& endpoints_tls,
+  const std::vector<model::broker_endpoint>& advertised) {
+    _server._routes.register_exeption_handler(
+      exception_replier{ss::sstring{name(_exceptional_mime_type)}, _log});
+
+    _default_handler = std::make_unique<default_404_handler>(
+      ss::sstring{name(_exceptional_mime_type)});
+    _server._routes.add_default_handler(_default_handler.get());
+
+    _probe = std::make_unique<server_probe>(_ctx, _public_metrics_group_name);
+
+    _ctx.advertised_listeners.reserve(endpoints.size());
+    for (auto& server_endpoint : endpoints) {
+        auto addr = co_await net::resolve_dns(server_endpoint.address);
+        auto it = find_if(
+          endpoints_tls.begin(),
+          endpoints_tls.end(),
+          [&server_endpoint](const config::endpoint_tls_config& ep_tls) {
+              return ep_tls.name == server_endpoint.name;
+          });
+        auto advertised_it = find_if(
+          advertised.begin(),
+          advertised.end(),
+          [&server_endpoint](const model::broker_endpoint& e) {
+              return e.name == server_endpoint.name;
+          });
+
+        // if we have advertised listener use it, otherwise use server
+        // endpoint address
+        if (advertised_it != advertised.end()) {
+            _ctx.advertised_listeners.push_back(advertised_it->address);
+        } else {
+            _ctx.advertised_listeners.push_back(server_endpoint.address);
+        }
+
+        ss::shared_ptr<ss::tls::server_credentials> cred;
+        if (it != endpoints_tls.end()) {
+            cred = co_await net::build_reloadable_server_credentials_with_probe(
+              it->config,
+              _public_metrics_group_name,
+              it->name,
+              [&log = _log](
+                const std::unordered_set<ss::sstring>& updated,
+                const std::exception_ptr& eptr) {
+                  rpc::log_certificate_reload_event(
+                    log, "API TLS", updated, eptr);
+              });
+        }
+        co_await _server.listen(addr, cred);
+    }
+
+    co_return;
+}
+
+ss::future<> server::stop() {
+    return _pending_reqs.close().finally([this]() {
+        _ctx.as.request_abort();
+        _probe.reset(nullptr);
+        return _server.stop().finally([this]() { _default_handler.reset(); });
+    });
+}
+
+server::~server() noexcept = default;
+
+} // namespace pandaproxy

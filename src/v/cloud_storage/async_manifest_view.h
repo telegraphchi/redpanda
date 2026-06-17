@@ -1,0 +1,455 @@
+/*
+ * Copyright 2023 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
+
+#pragma once
+
+#include "base/format_to.h"
+#include "base/outcome.h"
+#include "cloud_storage/async_manifest_materializer.h"
+#include "cloud_storage/fwd.h"
+#include "cloud_storage/materialized_manifest_cache.h"
+#include "cloud_storage/read_path_probes.h"
+#include "cloud_storage/remote_path_provider.h"
+#include "cloud_storage/types.h"
+#include "model/timestamp.h"
+#include "ssx/task_local_ptr.h"
+#include "utils/retry_chain_node.h"
+
+#include <seastar/core/abort_source.hh>
+#include <seastar/core/loop.hh>
+#include <seastar/core/lowres_clock.hh>
+#include <seastar/core/semaphore.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/timed_out_error.hh>
+
+#include <chrono>
+#include <variant>
+
+namespace cloud_storage {
+
+struct async_view_timestamp_query {
+    async_view_timestamp_query(
+      kafka::offset min_offset, model::timestamp ts, kafka::offset max_offset)
+      : min_offset(min_offset)
+      , ts(ts)
+      , max_offset(max_offset) {}
+
+    fmt::iterator format_to(fmt::iterator it) const {
+        return fmt::format_to(
+          it,
+          "async_view_timestamp_query{{min_offset:{}, ts:{}, "
+          "max_offset:{}}}",
+          min_offset,
+          ts,
+          max_offset);
+    }
+
+    kafka::offset min_offset;
+    model::timestamp ts;
+    kafka::offset max_offset;
+};
+
+/// Search query type
+using async_view_search_query_t
+  = std::variant<model::offset, kafka::offset, async_view_timestamp_query>;
+
+fmt::iterator format_to(const async_view_search_query_t& q, fmt::iterator out);
+
+} // namespace cloud_storage
+
+template<>
+struct fmt::formatter<cloud_storage::async_view_search_query_t> {
+    constexpr auto parse(fmt::format_parse_context& ctx) const {
+        return ctx.begin();
+    }
+    fmt::iterator format(
+      const cloud_storage::async_view_search_query_t& q,
+      fmt::format_context& ctx) const {
+        return cloud_storage::format_to(q, ctx.out());
+    }
+};
+
+namespace cloud_storage {
+
+class async_manifest_view;
+
+/// The structure represents evicted manifest. The difference between this
+/// state and uninitialized state is that 'stale_manifest' will trigger
+/// timed_out error on first access.
+struct stale_manifest {
+    /// Cached last offset value + 1 of the stale manifest
+    model::offset next_offset;
+};
+
+/// Type that represents section of full metadata. It can either contain
+/// a materialized spillover manifest or reference to main STM manifest.
+using data_manifest = std::variant<
+  ss::shared_ptr<materialized_manifest>,
+  std::reference_wrapper<const partition_manifest>>;
+
+class async_manifest_view_cursor;
+
+/// Service that maintains a view of the entire
+/// partition metadata including STM manifest and
+/// all spillover manifests. Spillover manifests are
+/// materialized on demand.
+class async_manifest_view {
+    friend class async_manifest_view_cursor;
+
+public:
+    async_manifest_view(
+      ss::sharded<remote>& remote,
+      ss::sharded<cloud_io::cache>& cache,
+      const partition_manifest& stm_manifest,
+      cloud_storage_clients::bucket_name bucket,
+      const remote_path_provider& path_provider);
+
+    ss::future<> start();
+    ss::future<> stop();
+
+    enum class cursor_base_t {
+        archive_start_offset,
+
+        /// Special case that is used when computing retention.
+        ///
+        /// For details, see:
+        /// GitHub: https://github.com/redpanda-data/redpanda/pull/12177
+        /// Commit: 1b6ab7be8818e3878a32f9037694ae5c4cf4fea2
+        archive_clean_offset,
+    };
+
+    /// Get active spillover manifests asynchronously
+    ///
+    /// \note the method may hydrate manifests in the cache or
+    ///       wait until the memory for the manifest becomes
+    ///       available.
+    ss::future<
+      result<std::unique_ptr<async_manifest_view_cursor>, error_outcome>>
+    get_cursor(
+      async_view_search_query_t q,
+      std::optional<model::offset> end_inclusive = std::nullopt,
+      cursor_base_t cursor_base = cursor_base_t::archive_start_offset) noexcept;
+
+    /// Get inactive spillover manifests which are waiting for
+    /// retention
+    ss::future<
+      result<std::unique_ptr<async_manifest_view_cursor>, error_outcome>>
+    get_retention_backlog() noexcept;
+
+    ss::future<result<std::optional<kafka::offset>, error_outcome>>
+    get_term_last_offset(model::term_id term) noexcept;
+
+    bool is_empty() const noexcept;
+
+    const model::ntp& get_ntp() const { return _stm_manifest.get_ntp(); }
+
+    /// Return STM manifest
+    const partition_manifest& stm_manifest() const { return _stm_manifest; }
+
+    /// Structure that describes how the start archive offset has
+    /// to be advanced forward.
+    struct archive_start_offset_advance {
+        model::offset offset;
+        model::offset_delta delta;
+    };
+
+    /// Compute how the start archive offset has to be advanced based on current
+    /// log size and retention parameters.
+    ss::future<result<archive_start_offset_advance, error_outcome>>
+    compute_retention(
+      std::optional<size_t> size_limit,
+      std::optional<std::chrono::milliseconds> time_limit,
+      std::optional<kafka::offset> pinned_offset = std::nullopt) noexcept;
+
+    const remote_path_provider& path_provider() const {
+        return _remote_path_provider;
+    }
+
+private:
+    ss::future<result<archive_start_offset_advance, error_outcome>>
+    time_based_retention(std::chrono::milliseconds time_limit) noexcept;
+
+    ss::future<result<archive_start_offset_advance, error_outcome>>
+    size_based_retention(size_t size_limit) noexcept;
+
+    // Find the next possible start offset for the archive (spillover region).
+    // If the offset is in the STM manifest, returns start offset of the STM
+    // manifest.
+    ss::future<result<archive_start_offset_advance, error_outcome>>
+      next_possible_start_offset_le(kafka::offset) noexcept;
+
+    // Perform a term upper bound search within the spillover manifest list.
+    // Returns the index of the first spillover manifest that contains a segment
+    // wit term greater than the requested one. If no such spillover manifest
+    // exists, returns std::nullopt.
+    std::optional<size_t>
+    get_spillover_upper_bound_by_term(model::term_id term) noexcept;
+
+    /// Return true if the offset belongs to the archive
+    bool in_archive(async_view_search_query_t o);
+
+    /// Returns true if the offset belongs to the archival STM manifest
+    bool in_stm(async_view_search_query_t o);
+
+    /// Get manifest by offset/timestamp
+    ss::future<result<data_manifest, error_outcome>>
+    get_manifest(async_view_search_query_t q) noexcept;
+
+    /// Find index of the spillover manifest
+    ///
+    /// \param query is a search query, either an offset, a kafka offset or a
+    ///              timestamp
+    /// \return segment_meta struct that represents a spillover manifest or null
+    std::optional<segment_meta>
+    search_spillover_manifests(async_view_search_query_t query) const;
+
+    mutable ss::gate _gate;
+    ss::abort_source _as;
+    const remote_path_provider& _remote_path_provider;
+
+    const partition_manifest& _stm_manifest;
+    mutable retry_chain_node _rtcnode;
+    retry_chain_logger _ctxlog;
+
+    config::binding<std::chrono::milliseconds> _manifest_meta_ttl;
+
+    async_manifest_materializer _materializer;
+};
+
+enum class async_manifest_view_cursor_status {
+    // The cursor is not set to any position and not materialized
+    empty,
+    // The cursor points to STM manifest
+    materialized_stm,
+    // The cursor points to spillover manifest
+    materialized_spillover,
+    // The materialized manifest that cursor pointed to was evicted
+    evicted,
+};
+
+inline fmt::iterator
+format_to(async_manifest_view_cursor_status s, fmt::iterator out) {
+    switch (s) {
+    case async_manifest_view_cursor_status::empty:
+        return fmt::format_to(out, "empty");
+    case async_manifest_view_cursor_status::evicted:
+        return fmt::format_to(out, "evicted");
+    case async_manifest_view_cursor_status::materialized_stm:
+        return fmt::format_to(out, "materialized_stm");
+    case async_manifest_view_cursor_status::materialized_spillover:
+        return fmt::format_to(out, "materialized_spillover");
+    }
+}
+
+/// The cursor can be used to traverse manifest
+/// asynchronously. The full content of the manifest
+/// can't b loaded into memory. Because of that the spillover
+/// manifests has to be loaded into memory asynchronously while
+/// the full manifest view is being traversed. This is done in
+/// batches in the 'refresh' call.
+///
+/// The cursor has two important properties:
+/// - offset range to cover, the cursor can only return manifests within the
+///   pre-defined offset range;
+/// - time budget limits amount of time the cursor can hold the materialized
+///   manifest
+class async_manifest_view_cursor {
+public:
+    /// Create cursor with allowed offset range limits
+    ///
+    /// \param view is an async_manifest_view instance
+    /// \param begin is a start of the allowed offset range
+    /// \param end_inclusive is an end of the allowed offset range
+    /// \param timeout is a time budget of the cursor
+    async_manifest_view_cursor(
+      async_manifest_view& view,
+      model::offset begin,
+      model::offset end_inclusive,
+      ss::lowres_clock::duration timeout);
+
+    /// Seek to manifest that contains offset
+    ss::future<result<bool, error_outcome>> seek(async_view_search_query_t q);
+
+    async_manifest_view_cursor_status get_status() const;
+
+    /// Move to the next manifest or fail
+    using eof = ss::bool_class<struct eof_tag>;
+    ss::future<result<eof, error_outcome>> next();
+
+    /// Shortcut to use with Seastar's future utils.
+    ///
+    /// The method returns 'stop_iteration' and it will also
+    /// throw an exception instead of returning an error code.
+    ss::future<ss::stop_iteration> next_iter();
+
+    /// Return current manifest
+    ///
+    /// \note the manifest is only valid during current time-slice and
+    ///       could be invalidated after any scheduling point. The pointer
+    ///       will be invalidated to prevent this from happening unnoticed.
+    ///       The caller shouldn't dereference and cache the raw pointer to
+    ///       the manifest anywhere.
+    /// \return pointer to the current manifest or nullopt
+    ssx::task_local_ptr<const partition_manifest> manifest() const;
+
+    /// Pass current manifest to the functor
+    ///
+    /// The method guarantees absence of scheduling points between the
+    /// calls to manifest methods. The manifest could be evicted after
+    /// any scheduling point. The reference will be invalidated in this
+    /// case.
+    template<class Fn>
+    auto with_manifest(Fn fn)
+      -> ss::future<decltype(fn(std::declval<const partition_manifest>()))> {
+        int quota = 4;
+        while (quota-- > 0) {
+            if (manifest_needs_sync()) {
+                // If the concurrent spillover event happens interim we will
+                // retry the operation after re-fetching the manifest.
+                co_await maybe_sync_manifest();
+                continue;
+            }
+            auto ref = manifest();
+            if (!ref.has_value()) {
+                throw std::runtime_error(fmt_with_ctx(
+                  fmt::format, "Invalid cursor, {}", _view.get_ntp()));
+            }
+            co_return fn(*ref);
+        }
+        // This shouldn't happen normally because spillover events are supposed
+        // to be rare. This might happen though when the spillover was disabled
+        // and then enabled for the first time. In this case ntp_archiver will
+        // spill several manifests in a row and the reader might get stuck.
+        throw std::runtime_error(fmt_with_ctx(
+          fmt::format,
+          "Failed to fetch manifest because concurrent spills, {}",
+          _view.get_ntp()));
+    }
+
+    /// Make sure that the cursor points to the right manifest
+    ///
+    /// If the cursor points at the STM manifest it may get out
+    /// of range after a scheduling point.
+    ss::future<> maybe_sync_manifest();
+
+    /// Returns 'false' if the manifest was changed concurrently
+    /// and the user could see a gap in segments.
+    bool manifest_needs_sync() const;
+
+private:
+    using stm_manifest_t = std::reference_wrapper<const partition_manifest>;
+    void on_timeout();
+
+    template<typename T>
+    void set_current(T&& m) {
+        _current = std::visit(
+          [](auto&& m) -> current_manifest_t { return m; }, std::forward<T>(m));
+    }
+
+    bool manifest_in_range(const data_manifest& m);
+
+    /// Manifest view ref
+    async_manifest_view& _view;
+
+    using current_manifest_t = std::variant<
+      // Uninitialized state.
+      std::monostate,
+      // Cursor points to STM manifest.
+      std::reference_wrapper<const partition_manifest>,
+      // Cursor points to spillover manifest.
+      ss::shared_ptr<materialized_manifest>,
+      // Cursor pointed to a spillover manifest that was evicted on idle
+      // timeout.
+      stale_manifest>;
+
+    current_manifest_t _current;
+
+    ss::lowres_clock::duration _idle_timeout;
+    ss::timer<ss::lowres_clock> _timer;
+    const model::offset _begin;
+    const model::offset _end;
+    std::optional<model::offset> _stm_start_offset{std::nullopt};
+};
+
+/// Invoke functor with every segment_meta accessible by the cursor
+/// The functor is expected to return stop_iteration::yes if the processing
+/// is completed.
+template<class Fn>
+ss::future<>
+for_each_segment(std::unique_ptr<async_manifest_view_cursor> cursor, Fn func) {
+    while (true) {
+        int quota = 4;
+        while (quota-- > 0) {
+            if (cursor->manifest_needs_sync()) {
+                // If the concurrent spillover event happens interim we will
+                // retry the operation after re-fetching the manifest.
+                co_await cursor->maybe_sync_manifest();
+                continue;
+            }
+            break;
+        }
+        if (cursor->manifest_needs_sync()) {
+            throw std::runtime_error(fmt_with_ctx(
+              fmt::format,
+              "Failed to iterate to the next manifest due to contention"));
+        }
+        // Invoke functor
+        for (const auto& meta : *cursor->manifest()) {
+            auto stop = func(meta);
+            if (stop == ss::stop_iteration::yes) {
+                break;
+            }
+        }
+        if (co_await cursor->next_iter() == ss::stop_iteration::yes) {
+            break;
+        }
+    }
+}
+
+/// Invoke functor with every manifest accessible by the cursor
+/// The functor is expected to return stop_iteration::yes if the processing
+/// is completed.
+/// \param cursor is an initialized cursor, the cursor should be pointing
+///               somewhere
+/// \param func is a functor that accepts
+///             ssx::task_local_ptr<const partition_manifest>
+template<class Fn>
+ss::future<>
+for_each_manifest(std::unique_ptr<async_manifest_view_cursor> cursor, Fn func) {
+    while (true) {
+        int quota = 4;
+        while (quota-- > 0) {
+            if (cursor->manifest_needs_sync()) {
+                // If the concurrent spillover event happens interim we will
+                // retry the operation after re-fetching the manifest.
+                co_await cursor->maybe_sync_manifest();
+                continue;
+            }
+            break;
+        }
+        if (cursor->manifest_needs_sync()) {
+            throw std::runtime_error(fmt_with_ctx(
+              fmt::format,
+              "Failed to iterate to the next manifest due to contention"));
+        }
+
+        // Invoke functor
+        auto stop = func(cursor->manifest());
+        if (stop == ss::stop_iteration::yes) {
+            break;
+        }
+        if (co_await cursor->next_iter() == ss::stop_iteration::yes) {
+            break;
+        }
+    }
+}
+
+} // namespace cloud_storage

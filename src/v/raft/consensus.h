@@ -1,0 +1,1005 @@
+/*
+ * Copyright 2020 Redpanda Data, Inc.
+ *
+ * Use of this software is governed by the Business Source License
+ * included in the file licenses/BSL.md
+ *
+ * As of the Change Date specified in that file, in accordance with
+ * the Business Source License, use of this software will be governed
+ * by the Apache License, Version 2.0
+ */
+
+#pragma once
+
+#include "base/format_to.h"
+#include "base/likely.h"
+#include "base/seastarx.h"
+#include "config/property.h"
+#include "features/feature_table.h"
+#include "hashing/crc32c.h"
+#include "metrics/metrics.h"
+#include "model/fundamental.h"
+#include "model/metadata.h"
+#include "raft/append_entries_buffer.h"
+#include "raft/compaction_coordinator.h"
+#include "raft/configuration_manager.h"
+#include "raft/consensus_client_protocol.h"
+#include "raft/consensus_utils.h"
+#include "raft/coordinated_recovery_throttle.h"
+#include "raft/event_manager.h"
+#include "raft/follower_states.h"
+#include "raft/group_configuration.h"
+#include "raft/heartbeats.h"
+#include "raft/logger.h"
+#include "raft/probe.h"
+#include "raft/recovery_memory_quota.h"
+#include "raft/recovery_scheduler.h"
+#include "raft/replicate_batcher.h"
+#include "raft/replication_monitor.h"
+#include "raft/state_machine_manager.h"
+#include "raft/timeout_jitter.h"
+#include "raft/transfer_leadership.h"
+#include "raft/types.h"
+#include "raft/voter_priority_tracker.h"
+#include "ssx/condition_variable.h"
+#include "ssx/mutex.h"
+#include "ssx/semaphore.h"
+#include "storage/log.h"
+#include "storage/snapshot.h"
+#include "storage/types.h"
+
+#include <seastar/core/abort_source.hh>
+#include <seastar/core/sharded.hh>
+#include <seastar/util/bool_class.hh>
+
+#include <optional>
+#include <string_view>
+
+namespace raft {
+class replicate_entries_stm;
+class vote_stm;
+class recovery_stm;
+class heartbeat_manager;
+
+std::vector<model::record_batch_type>
+offset_translator_batch_types(const model::ntp& ntp);
+
+/// consensus for one raft group
+class consensus {
+public:
+    // we maintain this for backward compatibility, will be removed in future
+    // versions.
+    struct voted_for_configuration_old {
+        model::node_id voted_for;
+        // for term it doesn't make sense to use numeric_limits<>::min
+        model::term_id term{0};
+
+        uint32_t crc() const {
+            crc::crc32c c;
+            c.extend(voted_for());
+            c.extend(term());
+            return c.value();
+        }
+    };
+    struct voted_for_configuration {
+        vnode voted_for;
+        // for term it doesn't make sense to use numeric_limits<>::min
+        model::term_id term{0};
+
+        uint32_t crc() const {
+            crc::crc32c c;
+            c.extend(voted_for.id()());
+            c.extend(voted_for.revision()());
+            c.extend(term());
+            return c.value();
+        }
+    };
+    enum class vote_state { follower, candidate, leader };
+    using leader_cb_t = ss::noncopyable_function<void(leadership_status)>;
+
+    consensus(
+      model::node_id,
+      group_id,
+      group_configuration,
+      timeout_jitter,
+      ss::shared_ptr<storage::log>,
+      scheduling_config,
+      config::binding<std::chrono::milliseconds> disk_timeout,
+      config::binding<bool> enable_longest_log_detection,
+      consensus_client_protocol,
+      leader_cb_t,
+      storage::api&,
+      std::optional<std::reference_wrapper<coordinated_recovery_throttle>>,
+      recovery_memory_quota&,
+      recovery_scheduler&,
+      features::feature_table&,
+      bool is_ready_for_leader_election = true,
+      keep_snapshotted_log = keep_snapshotted_log::no);
+
+    /// Initial call. Allow for internal state recovery
+    ss::future<> start(
+      std::optional<state_machine_manager_builder> = std::nullopt,
+      std::optional<xshard_transfer_state> = std::nullopt);
+
+    /// Stop all communications.
+    ss::future<xshard_transfer_state> stop();
+
+    /// Stop consensus instance from accepting requests
+    void shutdown_input();
+
+    ss::future<vote_reply> vote(vote_request&& r);
+    ss::future<append_entries_reply> append_entries(append_entries_request&& r);
+    ss::future<install_snapshot_reply>
+    install_snapshot(install_snapshot_request&& r);
+
+    ss::future<timeout_now_reply> timeout_now(timeout_now_request r);
+
+    /// This method adds member to a group
+    ss::future<std::error_code>
+      add_group_member(model::broker, model::revision_id);
+    /// Updates given member configuration
+    ss::future<std::error_code> update_group_member(model::broker);
+    // Removes member from group
+    ss::future<std::error_code>
+      remove_member(model::node_id, model::revision_id);
+    /**
+     * Replace configuration, uses revision provided with brokers
+     */
+    ss::future<std::error_code>
+      replace_configuration(std::vector<broker_revision>, model::revision_id);
+
+    /**
+     * New simplified configuration change API, accepting only vnode instead of
+     * full broker object
+     */
+    ss::future<std::error_code> add_group_member(
+      vnode node_to_add,
+      model::revision_id new_configuration_revision,
+      std::optional<model::offset> learner_start_offset = std::nullopt);
+    ss::future<std::error_code> remove_member(vnode, model::revision_id);
+    ss::future<std::error_code> replace_configuration(
+      std::vector<vnode> new_nodes,
+      model::revision_id new_configuration_revision,
+      std::optional<model::offset> learner_start_offset = std::nullopt);
+
+    /**
+     * This forcibly replaces the group configuration on this replica.
+     * This operation is volatile only, and does not persist data to disk.
+     * This is unclean by design and can cause a data loss. Should
+     * only be used in exceptional circumstances trying to recover from a lost
+     * majority.
+     */
+    ss::future<std::error_code> force_replace_configuration_locally(
+      std::vector<vnode> voters,
+      std::vector<vnode> learners,
+      model::revision_id);
+
+    // Abort ongoing configuration change - may cause data loss
+    ss::future<std::error_code> abort_configuration_change(model::revision_id);
+    // Revert current configuration change - this is safe and will never cause
+    // data loss
+    ss::future<std::error_code> cancel_configuration_change(model::revision_id);
+    bool is_elected_leader() const { return _vstate == vote_state::leader; }
+    // The node won the elections and made sure that the records written in
+    // previous term are behind committed index
+    bool is_leader() const {
+        return is_elected_leader() && _term == _confirmed_term;
+    }
+    bool is_candidate() const { return _vstate == vote_state::candidate; }
+    std::optional<model::node_id> get_leader_id() const {
+        return _leader_id ? std::make_optional(_leader_id->id()) : std::nullopt;
+    }
+
+    /**
+     * On leader, return the number of under replicated followers.  On
+     * followers, return nullopt
+     */
+    std::optional<uint8_t> get_under_replicated() const;
+
+    /**
+     * Sends a round of heartbeats to followers, when majority of followers
+     * replied with success to either this of any following request all reads up
+     * to returned offsets are linearizable. (i.e. majority of followers have
+     * updated their commit indices to at least returned offset). For more
+     * details see paragraph 6.4 of Raft protocol dissertation.
+     */
+    ss::future<result<model::offset>> linearizable_barrier(
+      model::timeout_clock::time_point deadline = model::no_timeout);
+
+    vnode self() const { return _self; }
+    protocol_metadata meta() const;
+    raft::group_id group() const { return _group; }
+    model::term_id term() const { return _term; }
+    const group_configuration& config() const;
+    const model::ntp& ntp() const { return _log->config().ntp(); }
+    clock_type::time_point last_heartbeat() const { return _hbeat; };
+    clock_type::time_point became_leader_at() const {
+        return _became_leader_at;
+    };
+
+    clock_type::time_point last_sent_append_entries_req_timestamp(vnode);
+    /**
+     * \brief Persist snapshot with given data and start offset
+     *
+     * The write snapshot API is called by the state machine implementation
+     * whenever it decides to take a snapshot. Write snapshot is executed under
+     * consensus operations lock.
+     */
+    ss::future<> write_snapshot(write_snapshot_cfg);
+
+    struct opened_snapshot {
+        raft::snapshot_metadata metadata;
+        storage::snapshot_reader reader;
+
+        ss::future<> close() { return reader.close(); }
+    };
+
+    // Open the current snapshot for reading (if present)
+    ss::future<std::optional<opened_snapshot>> open_snapshot();
+    ss::future<std::optional<ss::file>> open_snapshot_file() const;
+
+    std::filesystem::path get_snapshot_path() const {
+        return _snapshot_mgr.snapshot_path();
+    }
+
+    // This method will snapshot the log at somepoint <= `eviction_point` and
+    // then truncate the log. This should be used by retention mechansims to
+    // truncate the log safely.
+    //
+    // Returns true if the log was evicted fully up to some possible truncation
+    // point (which is the last segment boundary <= `eviction_point`).
+    ss::future<bool> snapshot_and_truncate_log(model::offset eviction_point);
+
+    /// Increment and returns next append_entries order tracking sequence for
+    /// follower with given node id
+    follower_req_seq next_follower_sequence(vnode);
+
+    void process_append_entries_reply(
+      model::node_id,
+      result<append_entries_reply>,
+      follower_req_seq,
+      model::offset);
+
+    /**
+     * Replication happens only when replicated_options::expected_term matches
+     * the current _term otherwise consensus returns not_leader.
+     * This feature is needed to keep ingestion-time state machine in sync
+     * with the log. The conventional state machines running on top on the log
+     * are optimistic: to execute a command a user should add a command to a
+     * log (replicate) then continue reading the commands from the log and
+     * executing them one after another.
+     * When the commands are conditional the conventional approach is wasteful
+     * because we even when a condition resolves to false we still pay the
+     * replication costs. An alternative approach is to check the conditions
+     * before replication but in this case there is a risk of divergence between
+     * the log and the state (e.g. a leadership moves to an another broker, it
+     * adds messages then the leadership moves back). The expected_term
+     * prevents this situation. The expected use case is:
+     *   1. when a cached term matches consensus.term() call replicate using
+     *      the cached term as expected_term
+     *   2. otherwise:
+     *      a. abrt all incoming requests
+     *      b. call consensus meta() to get the latest offset and a term
+     *      c. wait until the state caches up with the latest offset
+     *      d. cache the term
+     *      e. continue with step #1
+     */
+    ss::future<result<replicate_result>>
+      replicate(chunked_vector<model::record_batch>, replicate_options);
+    ss::future<result<replicate_result>>
+      replicate(model::record_batch, replicate_options);
+    replicate_stages replicate_in_stages(
+      chunked_vector<model::record_batch>, replicate_options);
+    replicate_stages
+      replicate_in_stages(model::record_batch, replicate_options);
+
+    uint64_t get_snapshot_size() const { return _snapshot_size; }
+
+    std::optional<state_machine_manager>& stm_manager() { return _stm_manager; }
+
+    ss::future<model::record_batch_reader>
+      make_reader(storage::local_log_reader_config);
+
+    model::offset get_latest_configuration_offset() const;
+    model::offset committed_offset() const { return _commit_index; }
+    model::offset flushed_offset() const { return _flushed_offset; }
+    model::offset last_quorum_replicated_index() const {
+        return _last_quorum_replicated_index_with_flush;
+    }
+    model::offset majority_replicated_index() const {
+        return _majority_replicated_index;
+    }
+    model::offset visibility_upper_bound_index() const {
+        return _visibility_upper_bound_index;
+    }
+    model::term_id confirmed_term() const { return _confirmed_term; }
+
+    /**
+     * Last visible index is an offset that is safe to be fetched by the
+     * consumers. This is similar to Kafka's HighWatermark. Last visible
+     * offset depends on the consistency level of messages replicated by the
+     * consensus instance and state of the log. Last visible offset similarly
+     * to HighWaterMark is monotonic and can never move backward. Last visible
+     * offset is always greater than log start offset and smaller than log dirty
+     * offset.
+     *
+     * Last visible offset is updated in two scenarios
+     *
+     * - commited offset is updated (consistency_level=quorum)
+     * - when batch that was appendend to the leader log is safely replicated on
+     *   majority of nodes
+     *
+     * We always update last visible index with std::max(prev,
+     * possible_value) to guarantee its monotonicity.
+     *
+     */
+    model::offset last_visible_index() const {
+        return std::min(
+          _majority_replicated_index, _visibility_upper_bound_index);
+    };
+
+    model::offset last_leader_visible_index() const {
+        return _last_leader_visible_offset;
+    };
+
+    ss::future<offset_configuration>
+    wait_for_config_change(model::offset last_seen, ss::abort_source& as) {
+        return _configuration_manager.wait_for_change(last_seen, as);
+    }
+
+    ss::future<> step_down(model::term_id term, std::string_view ctx) {
+        return _op_lock.with([this, term, ctx] {
+            // check again under op_lock semaphore, make sure we do not move
+            // term backward
+            if (term > _term) {
+                _term = term;
+                _voted_for = {};
+                do_step_down(
+                  fmt::format(
+                    "external_stepdown with term {} - {}", term, ctx));
+            }
+        });
+    }
+
+    ss::future<> step_down(std::string_view ctx) {
+        return _op_lock.with([this, ctx] {
+            do_step_down(fmt::format("external_stepdown - {}", ctx));
+            if (_leader_id) {
+                _leader_id = std::nullopt;
+                trigger_leadership_notification();
+            }
+        });
+    }
+    ss::future<> step_down_in_term(model::term_id term, std::string_view ctx) {
+        return _op_lock.with([this, term, ctx] {
+            if (_term != term) {
+                vlog(
+                  _ctxlog.trace,
+                  "[{}] Skipping leader step down in term {}, current term: {}",
+                  ctx,
+                  term,
+                  _term);
+                return;
+            }
+            do_step_down(fmt::format("external_stepdown - {}", ctx));
+            if (_leader_id) {
+                _leader_id = std::nullopt;
+                trigger_leadership_notification();
+            }
+        });
+    }
+
+    ss::future<std::optional<storage::timequery_result>>
+    timequery(storage::timequery_config cfg);
+
+    model::offset last_snapshot_index() const { return _last_snapshot_index; }
+    model::term_id last_snapshot_term() const { return _last_snapshot_term; }
+    model::offset received_snapshot_index() const {
+        return _received_snapshot_index;
+    }
+    size_t received_snapshot_bytes() const { return _received_snapshot_bytes; }
+    bool has_pending_flushes() const { return _pending_flush_bytes > 0; }
+    std::chrono::milliseconds time_since_last_flush() const {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+          clock_type::now() - _last_flush_time);
+    }
+
+    model::offset start_offset() const {
+        return model::next_offset(_last_snapshot_index);
+    }
+
+    model::offset dirty_offset() const { return _log->offsets().dirty_offset; }
+
+    ssx::condition_variable& commit_index_updated() {
+        return _commit_index_updated;
+    }
+
+    event_manager& events() { return _event_manager; }
+
+    ss::future<model::offset> monitor_log_eviction(ss::abort_source& as) {
+        return _log->monitor_eviction(as);
+    }
+
+    const storage::ntp_config& log_config() const { return _log->config(); }
+
+    /*
+     * Attempt to transfer leadership to another node in this raft group. If no
+     * node is specified, the most up-to-date node will be selected.
+     */
+    ss::future<transfer_leadership_reply>
+      transfer_leadership(transfer_leadership_request);
+    ss::future<std::error_code>
+      prepare_transfer_leadership(vnode, transfer_leadership_options);
+    ss::future<std::error_code>
+      do_transfer_leadership(transfer_leadership_request);
+
+    ss::future<> remove_persistent_state();
+
+    /**
+     *  Methods exposed for the state machine to speed up recovery
+     */
+    ss::future<> write_last_applied(model::offset);
+
+    model::offset read_last_applied() const;
+
+    probe& get_probe() { return *_probe; };
+
+    ss::shared_ptr<storage::log> log() { return _log; }
+
+    /**
+     * In our raft implementation heartbeats are sent outside of the consensus
+     * lock. In order to prevent reordering and do not flood followers with
+     * heartbeats that they will not be able to respond to we suppress sending
+     * heartbeats when other append entries request or heartbeat request is in
+     * flight. This RAII utility keeps track of inflight appends so heartbeat
+     * manager can decide whether to pause heartbeats while appends are in
+     * progress.
+     */
+
+    class inflight_appends_guard {
+    public:
+        inflight_appends_guard() noexcept = default;
+        explicit inflight_appends_guard(
+          consensus& parent, vnode target) noexcept;
+
+        void mark_finished();
+
+        inflight_appends_guard(inflight_appends_guard&& other) noexcept
+          : _parent(other._parent)
+          , _term(other._term)
+          , _target(other._target) {
+            other._parent = nullptr;
+        }
+        inflight_appends_guard(const inflight_appends_guard& other) = delete;
+        inflight_appends_guard&
+        operator=(inflight_appends_guard&& other) = delete;
+        inflight_appends_guard&
+        operator=(const inflight_appends_guard& other) = delete;
+        ~inflight_appends_guard() noexcept { mark_finished(); }
+
+    private:
+        consensus* _parent = nullptr;
+        model::term_id _term;
+        vnode _target;
+    };
+
+    // precondition: is_elected_leader() must be true.
+    inflight_appends_guard track_append_inflight(vnode);
+
+    void update_heartbeat_status(vnode, bool);
+
+    /// Zero `heartbeats_failed` for followers matching `node_id`. Called
+    /// after `ensure_disconnect` replaces the cached transport.
+    void reset_heartbeat_failures(model::node_id);
+
+    bool should_reconnect_follower(const follower_index_metadata&);
+
+    std::vector<follower_metrics> get_follower_metrics() const;
+    result<follower_metrics> get_follower_metrics(model::node_id) const;
+    size_t get_follower_count() const;
+    bool has_followers() const { return _fstates.size() > 0; }
+
+    offset_monitor<model::offset>& visible_offset_monitor() {
+        return _consumable_offset_monitor;
+    }
+
+    ss::future<> refresh_commit_index();
+
+    model::term_id get_term(model::offset) const;
+
+    /*
+     * Prevent the current node from becoming a leader for this group. If the
+     * node is the leader then this only takes affect if leadership is lost.
+     */
+    void block_new_leadership() { _priority_tracker.set_min_voter_priority(); }
+
+    /**
+     * Resets node priority only if it was not blocked
+     */
+    void mark_ready_for_leader_election() {
+        _priority_tracker.mark_ready_for_leader_election();
+    }
+
+    /*
+     * Allow the current node to become a leader for this group.
+     */
+    void unblock_new_leadership() {
+        _priority_tracker.reset_voter_priority_override();
+    }
+
+    const follower_states& get_follower_states() const { return _fstates; }
+
+    compaction_coordinator& get_compaction_coordinator() {
+        return _compaction_coordinator;
+    }
+
+    model::offset get_flushed_offset() const { return _flushed_offset; }
+
+    bool stopped() const { return _bg.is_closed(); }
+
+    reply_result lightweight_heartbeat(
+      model::node_id source_node, model::node_id target_node);
+
+    ss::future<full_heartbeat_reply> full_heartbeat(
+      group_id group,
+      model::node_id source_node,
+      model::node_id target_node,
+      const heartbeat_request_data& hb_data);
+
+    void reset_last_sent_protocol_meta(const vnode&);
+
+    const std::optional<follower_recovery_state>&
+    get_follower_recovery_state() const {
+        return _follower_recovery_state;
+    }
+
+    inline void maybe_update_leader(vnode request_node);
+
+    // hook called on desired cluster/topic configuration updates.
+    void notify_config_update();
+
+    bool write_caching_enabled() const { return _write_caching_enabled; }
+    size_t flush_bytes() const { return _max_pending_flush_bytes; }
+    std::chrono::milliseconds flush_ms() const;
+
+    replication_monitor& get_replication_monitor() {
+        return _replication_monitor;
+    }
+    /**
+     * Returns the number of bytes that are required to deliver to all
+     * learners that are being recovered.
+     */
+    size_t bytes_to_deliver_to_learners() const;
+
+    bool has_configuration_override() const {
+        return _configuration_manager.has_configuration_override();
+    }
+
+    // start/stop simulating failed requests (for debug purposes)
+    void toggle_append_entries_error_injection(bool inject_error) {
+        vlog(
+          _ctxlog.warn,
+          "toggle_append_entries_error_injection block={}",
+          inject_error);
+        _inject_error_in_append_entries = inject_error;
+    }
+
+private:
+    friend replication_monitor;
+    friend replicate_entries_stm;
+    friend vote_stm;
+    friend recovery_stm;
+    friend replicate_batcher;
+    friend event_manager;
+    friend append_entries_buffer;
+    friend heartbeat_manager;
+    using update_last_quorum_index
+      = ss::bool_class<struct update_last_quorum_index>;
+    using flush_delay_t
+      = std::variant<std::chrono::milliseconds, std::chrono::years>;
+    // all these private functions assume that we are under exclusive operations
+    // via the _op_sem
+    void do_step_down(std::string_view);
+    // steps down and requests the other replica to start leader election
+    // immediately
+    ss::future<> transfer_and_stepdown(std::string_view);
+    ss::future<vote_reply> do_vote(vote_request);
+    ss::future<append_entries_reply>
+    do_append_entries(append_entries_request&&);
+    ss::future<install_snapshot_reply>
+    do_install_snapshot(install_snapshot_request r);
+    ss::future<> do_start(std::optional<xshard_transfer_state>);
+
+    ss::future<result<replicate_result>> dispatch_replicate(
+      append_entries_request,
+      std::vector<ssx::semaphore_units>,
+      absl::flat_hash_map<vnode, follower_req_seq>);
+    /**
+     * Hydrate the consensus state with the data from the snapshot
+     */
+    ss::future<> hydrate_snapshot();
+
+    void update_snapshot_offset(const snapshot_metadata&);
+    ss::future<std::optional<snapshot_metadata>> read_snapshot_metadata();
+
+    /**
+     * Truncates the log up the last offset stored in the snapshot
+     */
+    std::optional<storage::truncate_prefix_config>
+    truncation_cfg_for_snapshot(const snapshot_metadata&);
+    ss::future<> truncate_to_latest_snapshot(storage::truncate_prefix_config);
+    ss::future<install_snapshot_reply>
+      finish_snapshot(install_snapshot_request, install_snapshot_reply);
+
+    ss::future<> do_snapshot_and_truncate_log(model::offset);
+    ss::future<> do_write_snapshot(model::offset, iobuf&&);
+    append_entries_reply
+      make_append_entries_reply(vnode, storage::append_result);
+
+    replicate_stages
+      do_replicate(chunked_vector<model::record_batch>, replicate_options);
+
+    ss::future<result<replicate_result>> chain_stages(replicate_stages);
+
+    ss::future<storage::append_result> disk_append(
+      chunked_vector<model::record_batch>, update_last_quorum_index);
+
+    using success_reply = ss::bool_class<struct successfull_reply_tag>;
+
+    success_reply update_follower_index(
+      model::node_id,
+      const result<append_entries_reply>&,
+      follower_req_seq seq_id,
+      model::offset);
+
+    void successfull_append_entries_reply(
+      follower_index_metadata&, const append_entries_reply&);
+
+    size_t estimate_recovering_followers() const;
+    bool needs_recovery(const follower_index_metadata&, model::offset);
+    void dispatch_recovery(follower_index_metadata&);
+    void maybe_update_leader_commit_idx();
+    ss::future<> do_maybe_update_leader_commit_idx(ssx::semaphore_units);
+
+    clock_type::time_point majority_heartbeat() const;
+    /*
+     * Start an election. When leadership transfer is requested, the election is
+     * started immediately, and the vote request will contain a flag that
+     * requests stable leadership optimization to be ignored.
+     */
+    void dispatch_vote(bool leadership_transfer);
+    ss::future<election_success> dispatch_prevote(bool leadership_transfer);
+    bool should_skip_vote(bool ignore_heartbeat);
+
+    /// Replicates configuration to other nodes,
+    //  caller have to pass in _op_sem semaphore units
+    ss::future<std::error_code>
+    replicate_configuration(ssx::semaphore_units u, group_configuration);
+
+    void maybe_update_follower_commit_idx(model::offset);
+
+    void arm_vote_timeout();
+    void update_node_append_timestamp(vnode);
+    void maybe_update_node_reply_timestamp(vnode);
+
+    void update_follower_states(const group_configuration&);
+    void trigger_leadership_notification();
+
+    /// \brief _does not_ hold the lock.
+    using flushed = ss::bool_class<struct flushed_executed_tag>;
+    ss::future<flushed> flush_log();
+    /// flush spawned with a gate.
+    void background_flush_log();
+    void maybe_schedule_flush();
+
+    void maybe_step_down();
+
+    absl::flat_hash_map<vnode, follower_req_seq> next_followers_request_seq();
+
+    void setup_metrics();
+    void setup_public_metrics();
+
+    bytes voted_for_key() const {
+        return raft::details::serialize_group_key(
+          _group, metadata_key::voted_for);
+    }
+    void read_voted_for();
+    ss::future<> write_voted_for(consensus::voted_for_configuration);
+    model::term_id get_last_entry_term(const storage::offset_stats&) const;
+
+    template<typename Func>
+    ss::future<std::error_code> change_configuration(Func&&);
+
+    model::offset_delta
+    get_offset_delta(const storage::offset_stats&, model::offset) const;
+    template<typename Func>
+    ss::future<std::error_code>
+      interrupt_configuration_change(model::revision_id, Func);
+
+    ss::future<> maybe_commit_configuration(ssx::semaphore_units);
+    ss::future<> do_commit_configuration_transition(ssx::semaphore_units);
+    void maybe_promote_to_voter(vnode);
+
+    ss::future<model::record_batch_reader>
+      do_make_reader(storage::local_log_reader_config);
+
+    bytes last_applied_key() const {
+        return raft::details::serialize_group_key(
+          _group, metadata_key::last_applied_offset);
+    }
+
+    void maybe_update_last_visible_index(model::offset);
+    void maybe_update_majority_replicated_index();
+    void do_update_majority_replicated_index(model::offset new_value);
+
+    template<typename Reply>
+    result<Reply> validate_reply_target_node(
+      std::string_view request,
+      result<Reply> reply,
+      model::node_id requested_node_id) {
+        if (reply) {
+            // since we are not going to introduce the node in ADL versions of
+            // replies it may be not initialzed, in this case just ignore the
+            // check
+            if (
+              unlikely(
+                reply.value().node_id != vnode{}
+                && reply.value().node_id.id() != requested_node_id)) {
+                vlog(
+                  _ctxlog.warn,
+                  "received {} reply from a node that id does not match the "
+                  "requested one. Received: {}, requested: {}",
+                  request,
+                  reply.value().node_id.id(),
+                  requested_node_id);
+                return result<Reply>(errc::invalid_target_node);
+            }
+            if (unlikely(reply.value().target_node_id != self())) {
+                /**
+                 * if received node_id is not initialized it means that there
+                 * were no raft group instance on target node to handle the
+                 * request.
+                 */
+                if (reply.value().target_node_id.id() == model::node_id{}) {
+                    // A grace period, where perhaps it is okay that a peer
+                    // hasn't seen the controller log message that created
+                    // this partition yet.
+                    static constexpr clock_type::duration grace = 30s;
+                    bool instantiated_recently = (clock_type::now()
+                                                  - _instantiated_at)
+                                                 < grace;
+                    if (!instantiated_recently) {
+                        vlog(
+                          _ctxlog.warn,
+                          "received {} reply from the node where ntp {} does "
+                          "not "
+                          "exists",
+                          request,
+                          _log->config().ntp());
+                    }
+                    return result<Reply>(errc::group_not_exists);
+                }
+
+                vlog(
+                  _ctxlog.warn,
+                  "received {} reply addressed to different node: {}, current "
+                  "node: {}",
+                  request,
+                  reply.value().target_node_id,
+                  _self);
+                return result<Reply>(errc::invalid_target_node);
+            }
+        }
+        return std::move(reply);
+    }
+
+    template<typename Request>
+    bool is_request_target_node_invalid(
+      std::string_view request_name, const Request& request) {
+        auto target = request.target_node();
+        if (unlikely(target != _self)) {
+            vlog(
+              _ctxlog.warn,
+              "received {} request addressed to different node: {}, current "
+              "node: {}, source: {}",
+              request_name,
+              target,
+              _self,
+              request.source_node());
+            return true;
+        }
+        return false;
+    }
+
+    void maybe_upgrade_configuration_to_v4(group_configuration&);
+
+    void update_confirmed_term();
+
+    // Called when during processing of an append_entries request we realize
+    // that we need recovery or that the leader is already recovering us.
+    // Will initialize or update _follower_recovery_state.
+    void upsert_recovery_state(
+      model::offset our_last_offset,
+      model::offset leader_last_offset,
+      bool already_recovering);
+
+    std::optional<model::offset> get_learner_start_offset() const;
+
+    flush_delay_t compute_max_flush_delay() const;
+    ss::future<> do_flush();
+
+    bool supports_symmetric_reconfiguration_cancel() const {
+        return _features.is_active(
+          features::feature::raft_symmetric_reconfiguration_cancel);
+    }
+
+    void try_updating_configuration_version(group_configuration& cfg);
+
+    void validate_offset_translator_delta(
+      const protocol_metadata&, const storage::offset_stats& lstats);
+
+    std::optional<model::offset>
+      adjust_learner_initial_offset(std::optional<model::offset>);
+
+    const std::vector<vnode>& all_replicas() const;
+    // args
+    vnode _self;
+    raft::group_id _group;
+    timeout_jitter _jit;
+    ss::shared_ptr<storage::log> _log;
+    scheduling_config _scheduling;
+    config::binding<std::chrono::milliseconds> _disk_timeout;
+    config::binding<bool> _enable_longest_log_detection;
+    consensus_client_protocol _client_protocol;
+    leader_cb_t _leader_notification;
+
+    // consensus state
+    model::offset _commit_index;
+    model::term_id _term;
+
+    /**
+     * A confirmed term is used to determine if the state of a replica is up to
+     * date after the leader election. Only after the confirmed term is equal to
+     * the current term one can reason about the Raft group state.
+     *
+     * On the leader the confirmed term is updated after first successful
+     * replication of a batch subsequent to a leader election. After the
+     * replication succeed leader is guaranteed to have up to date committed and
+     * visible offsets.
+     *
+     * On the follower the confirmed term is updated only when an append entries
+     * request from the current leader may be accepted and follower may return
+     * success.
+     */
+    model::term_id _confirmed_term;
+    model::offset _flushed_offset{};
+
+    // read at `ss::future<> start()`
+    vnode _voted_for;
+    std::optional<vnode> _leader_id;
+    bool _transferring_leadership{false};
+
+    /// useful for when we are not the leader
+    clock_type::time_point _hbeat = clock_type::now(); // is max() iff leader
+    clock_type::time_point _became_leader_at = clock_type::now();
+    clock_type::time_point _instantiated_at = clock_type::now();
+
+    /// used to keep track if we are a leader, or transitioning
+    vote_state _vstate = vote_state::follower;
+    /// used for votes only. heartbeats are done by heartbeat_manager
+    timer_type _vote_timeout;
+
+    /// used for keeping tally on followers
+    follower_states _fstates;
+
+    /// used to wait for background ops before shutting down
+    ss::gate _bg;
+
+    ss::abort_source _as;
+    mutable ctx_log _ctxlog;
+    features::feature_table& _features;
+
+    /// used to coordinate compaction and tombstone removals taking all replica
+    /// logs into account
+    compaction_coordinator _compaction_coordinator;
+
+    replicate_batcher _batcher;
+    size_t _pending_flush_bytes{0};
+    clock_type::time_point _last_flush_time;
+    /// Ensures that we do not schedule multiple redudant flushes.
+    bool _in_flight_flush = false;
+
+    /**
+     * Locks listed in the order of nestedness, election being the outermost
+     * and snapshot the innermost. I.e. if any of these locks are used at the
+     * same time, they should be acquired in the listed order and released in
+     * reverse order.
+     */
+    /// guards from concurrent election where this instance is a candidate
+    ssx::mutex _election_lock{"consensus::election_lock"};
+    /// all raft operations must happen exclusively since the common case
+    /// is for the operation to touch the disk
+    ssx::mutex _op_lock{"consensus::op_lock"};
+    /// since snapshot state is orthogonal to raft state when writing snapshot
+    /// it is enough to grab the snapshot mutex, there is no need to keep
+    /// oplock
+    ssx::mutex _snapshot_lock{"consensus::snapshot_lock"};
+
+    /// used for notifying when commits happened to log
+    event_manager _event_manager;
+    std::unique_ptr<probe> _probe;
+    ssx::condition_variable _commit_index_updated;
+    ssx::condition_variable _leadership_changed;
+
+    std::chrono::milliseconds _replicate_append_timeout;
+    std::chrono::milliseconds _recovery_append_timeout;
+    size_t _heartbeat_disconnect_failures;
+    metrics::internal_metric_groups _metrics;
+    storage::api& _storage;
+    std::optional<std::reference_wrapper<coordinated_recovery_throttle>>
+      _recovery_throttle;
+    recovery_memory_quota& _recovery_mem_quota;
+    recovery_scheduler& _recovery_scheduler;
+    storage::simple_snapshot_manager _snapshot_mgr;
+    uint64_t _snapshot_size{0};
+    std::optional<storage::file_snapshot_writer> _snapshot_writer;
+    model::offset _last_snapshot_index;
+    model::term_id _last_snapshot_term;
+    configuration_manager _configuration_manager;
+    model::offset _majority_replicated_index;
+    model::offset _visibility_upper_bound_index;
+    voter_priority_tracker _priority_tracker;
+    keep_snapshotted_log _keep_snapshotted_log;
+
+    // used to track currently installed snapshot
+    model::offset _received_snapshot_index;
+    size_t _received_snapshot_bytes = 0;
+
+    /**
+     * We keep an index of the most recent entry replicated with quorum
+     * consistency level and flush to ensure they are not visible until
+     * they are raft committed (flushed on a majority). This ensures that
+     * writes with lower ack levels following the above writes do not
+     * mistakenly make them visible before they are raft committed.
+     */
+    model::offset _last_quorum_replicated_index_with_flush;
+    model::offset _last_leader_visible_offset;
+    flush_after_append _last_write_flushed;
+    offset_monitor<model::offset> _consumable_offset_monitor;
+    ss::condition_variable _follower_reply;
+    append_entries_buffer _append_requests_buffer;
+    std::optional<state_machine_manager> _stm_manager;
+    /**
+     * If a follower notices that it requires recovery, it starts tracking
+     * that via this object, which holds a place in the recovery_scheduler
+     * queue to regulate how many raft groups can go into recovery concurrently.
+     */
+    std::optional<follower_recovery_state> _follower_recovery_state;
+
+    // write caching configurations
+    // cached locally so we don't reconcile them for every request. They are
+    // updated lazily via notify_config_update()
+    using flush_jitter_t
+      = simple_time_jitter<clock_type, std::chrono::milliseconds>;
+    static constexpr std::chrono::milliseconds flush_ms_jitter{5};
+    bool _write_caching_enabled;
+    size_t _max_pending_flush_bytes;
+    // Its a variant to workaround a bug in cv::wait() method,
+    // check comment in compute_max_flush_delay() for details
+    flush_delay_t _max_flush_delay;
+
+    // Timer responsible for flush.ms. The timer is only armed when
+    // requests without an explicit flush arrive and the timer is
+    // immediately canceled if a flush is triggered via other means.
+    ss::timer<ss::lowres_clock> _deferred_flusher;
+
+    replication_monitor _replication_monitor;
+
+    // simulate storage issues
+    bool _inject_error_in_append_entries = false;
+
+public:
+    fmt::iterator format_to(fmt::iterator it) const;
+};
+
+} // namespace raft

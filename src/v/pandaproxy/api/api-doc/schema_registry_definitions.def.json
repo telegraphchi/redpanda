@@ -1,0 +1,341 @@
+
+    "error_body": {
+      "type": "object",
+      "properties": {
+        "error_code": {
+          "type": "integer"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "schema_reference": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "The name used to reference this schema in the dependent schema definition."
+        },
+        "subject": {
+          "type": "string",
+          "description": "The subject name of the referenced schema. Use [:.<context>:]<subject> for context-qualified subjects, or just <subject> for the default context."
+        },
+        "version": {
+          "type": "integer",
+          "description": "The version of the referenced schema."
+        }
+      }
+    },
+    "schema_metadata_request": {
+      "type": "object",
+      "description": "A map of user-defined properties associated with this schema",
+      "properties": {
+        "properties": {
+          "type": "object",
+          "description": "Accepted values may be string, number, or boolean, they are converted to strings.",
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "number" },
+              { "type": "boolean" }
+            ]
+          }
+        }
+      }
+    },
+    "schema_metadata_response": {
+      "type": "object",
+      "properties": {
+        "properties": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "schema_def_request": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "type": "string"
+        },
+        "schemaType": {
+          "type": "string"
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/schema_reference"
+          }
+        },
+        "metadata": {
+          "$ref": "#/definitions/schema_metadata_request"
+        }
+      }
+    },
+    "schema_def_response": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "type": "string"
+        },
+        "schemaType": {
+          "type": "string"
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/schema_reference"
+          }
+        },
+        "metadata": {
+          "$ref": "#/definitions/schema_metadata_response"
+        }
+      }
+    },
+    "stored_schema_request": {
+      "type": "object",
+      "properties": {
+        "subject": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "integer"
+        },
+        "schemaType": {
+          "type": "string"
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/schema_reference"
+          }
+        },
+        "metadata": {
+          "$ref": "#/definitions/schema_metadata_request"
+        },
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "stored_schema_response": {
+      "type": "object",
+      "properties": {
+        "subject": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "integer"
+        },
+        "schemaType": {
+          "type": "string"
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/schema_reference"
+          }
+        },
+        "metadata": {
+          "$ref": "#/definitions/schema_metadata_response"
+        },
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "get_subject_versions_version_response": {
+      "type": "object",
+      "properties": {
+        "subject": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "integer"
+        },
+        "schemaType": {
+          "type": "string"
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/schema_reference"
+          }
+        },
+        "metadata": {
+          "$ref": "#/definitions/schema_metadata_response"
+        },
+        "schema": {
+          "type": "string"
+        },
+        "deleted": {
+          "type": "boolean"
+        }
+      }
+    },
+    "post_subject_versions_response": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer"
+        },
+        "version": {
+          "type": "integer"
+        },
+        "schemaType": {
+          "type": "string"
+        },
+        "references": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/schema_reference"
+          }
+        },
+        "metadata": {
+          "$ref": "#/definitions/schema_metadata_response"
+        },
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "get_compatibility": {
+      "type": "object",
+      "properties": {
+        "compatibilityLevel": {
+          "type": "string",
+          "description": "Compatibility level",
+          "example": "FULL_TRANSITIVE",
+          "enum": [
+            "BACKWARD",
+            "BACKWARD_TRANSITIVE",
+            "FORWARD",
+            "FORWARD_TRANSITIVE",
+            "FULL",
+            "FULL_TRANSITIVE",
+            "NONE"
+          ]
+        }
+      }
+    },
+    "put_compatibility": {
+      "type": "object",
+      "properties": {
+        "compatibility": {
+          "type": "string",
+          "description": "Compatibility level",
+          "example": "FULL_TRANSITIVE",
+          "enum": [
+            "BACKWARD",
+            "BACKWARD_TRANSITIVE",
+            "FORWARD",
+            "FORWARD_TRANSITIVE",
+            "FULL",
+            "FULL_TRANSITIVE",
+            "NONE"
+          ]
+        }
+      }
+    },
+    "mode": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "READWRITE",
+            "READONLY",
+            "IMPORT"
+          ]
+        }
+      }
+    },
+    "is_compatibile": {
+      "type": "object",
+      "properties": {
+        "is_compatible": {
+          "type": "boolean"
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "security_acl": {
+      "type": "object",
+      "required": [
+        "principal",
+        "resource",
+        "resource_type",
+        "pattern_type",
+        "host",
+        "operation",
+        "permission"
+      ],
+      "properties": {
+        "principal": {
+          "type": "string",
+          "description": "The name of the principal, for example, User:alice or RedpandaRole:admin. Use \"*\" to represent a wildcard."
+        },
+        "resource": {
+          "type": "string",
+          "description": "The name of the resource. Use \"*\" to represent a wildcard."
+        },
+        "resource_type": {
+          "type": "string",
+          "enum": [
+            "REGISTRY",
+            "SUBJECT"
+          ],
+          "description": "The type of resource being secured."
+        },
+        "pattern_type": {
+          "type": "string",
+          "enum": [
+            "LITERAL",
+            "PREFIXED"
+          ],
+          "description": "Pattern match type for the resource. Only applies when `resource_type` is SUBJECT."
+        },
+        "host": {
+          "type": "string",
+          "description": "Originating host for which this rule applies. Use \"*\" to represent a wildcard."
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "ALL",
+            "READ",
+            "WRITE",
+            "DELETE",
+            "DESCRIBE",
+            "DESCRIBE_CONFIGS",
+            "ALTER_CONFIGS"
+          ],
+          "description": "The operation to allow or deny."
+        },
+        "permission": {
+          "type": "string",
+          "enum": [
+            "ALLOW",
+            "DENY"
+          ],
+          "description": "Specifies whether the operation is allowed or denied."
+        }
+      }
+    }

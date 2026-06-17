@@ -1,0 +1,115 @@
+/*
+ * Copyright 2020 Redpanda Data, Inc.
+ *
+ * Use of this software is governed by the Business Source License
+ * included in the file licenses/BSL.md
+ *
+ * As of the Change Date specified in that file, in accordance with
+ * the Business Source License, use of this software will be governed
+ * by the Apache License, Version 2.0
+ */
+#pragma once
+#include "absl/container/node_hash_map.h"
+#include "base/outcome.h"
+#include "base/seastarx.h"
+#include "cluster/controller_backend.h"
+#include "cluster/fwd.h"
+#include "cluster/types.h"
+#include "model/fundamental.h"
+#include "model/metadata.h"
+#include "model/timeout_clock.h"
+#include "rpc/fwd.h"
+
+#include <seastar/core/abort_source.hh>
+#include <seastar/core/chunked_fifo.hh>
+#include <seastar/core/sharded.hh>
+
+#include <system_error>
+
+namespace cluster {
+/**
+ * An entry point to read controller/cluster state
+ */
+class controller_api {
+public:
+    controller_api(
+      model::node_id,
+      ss::sharded<controller_backend>&,
+      ss::sharded<topic_table>&,
+      ss::sharded<shard_table>&,
+      ss::sharded<rpc::connection_cache>&,
+      ss::sharded<members_table>&,
+      ss::sharded<partition_balancer_backend>&,
+      ss::sharded<partition_manager>&,
+      ss::sharded<partition_leaders_table>&,
+      ss::sharded<ss::abort_source>&);
+
+    ss::future<result<chunked_vector<ntp_reconciliation_state>>>
+      get_reconciliation_state(model::topic_namespace_view);
+
+    ss::future<chunked_vector<ntp_reconciliation_state>>
+      get_reconciliation_state(chunked_vector<model::ntp>);
+
+    ss::future<ntp_reconciliation_state> get_reconciliation_state(model::ntp);
+
+    ss::future<result<bool>> all_reconciliations_done(std::deque<model::ntp>);
+
+    /**
+     * API to access both remote and local state
+     */
+    ss::future<result<chunked_vector<ntp_reconciliation_state>>>
+      get_reconciliation_state(
+        model::node_id,
+        chunked_vector<model::ntp>,
+        model::timeout_clock::time_point);
+
+    ss::future<result<ntp_reconciliation_state>> get_reconciliation_state(
+      model::node_id, model::ntp, model::timeout_clock::time_point);
+
+    ss::future<result<ntp_reconciliation_state>>
+      get_partition_leader_reconciliation_state(
+        model::ntp, model::timeout_clock::time_point);
+
+    // high level APIs
+    ss::future<std::error_code> wait_for_topic(
+      model::topic_namespace_view, model::timeout_clock::time_point);
+
+    ss::future<result<chunked_vector<partition_reconfiguration_state>>>
+    get_partitions_leader_reconfiguration_state(
+      const chunked_vector<model::ntp>&, model::timeout_clock::time_point);
+    /**
+     * Returns state of controller backend from each node in the cluster for
+     * requested list of ntps. A global reconciliation status contains a state
+     * of reconciliation loop execution from every replica that is part of an
+     * ntp replica set.
+     */
+    ss::future<global_reconciliation_state> get_global_reconciliation_state(
+      const chunked_vector<model::ntp>&, model::timeout_clock::time_point);
+
+    ss::future<result<node_decommission_progress>>
+      get_node_decommission_progress(
+        model::node_id, model::timeout_clock::time_point);
+
+    std::optional<ss::shard_id> shard_for(const raft::group_id& group) const;
+    std::optional<ss::shard_id> shard_for(const model::ntp& ntp) const;
+
+private:
+    ss::future<std::optional<backend_operation>>
+      get_current_op(model::ntp, ss::shard_id);
+
+    ss::future<
+      result<chunked_hash_map<model::ntp, reallocation_failure_details>>>
+      get_decommission_allocation_failures(model::node_id);
+
+    model::node_id _self;
+    ss::sharded<controller_backend>& _backend;
+    ss::sharded<topic_table>& _topics;
+    ss::sharded<shard_table>& _shard_table;
+    ss::sharded<rpc::connection_cache>& _connections;
+    ss::sharded<members_table>& _members;
+    ss::sharded<partition_balancer_backend>& _partition_balancer;
+    ss::sharded<partition_manager>& _partition_manager;
+    ss::sharded<partition_leaders_table>& _partition_leaders;
+    ss::sharded<ss::abort_source>& _as;
+};
+} // namespace cluster

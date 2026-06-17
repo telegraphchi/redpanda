@@ -1,0 +1,30 @@
+---
+name: lint-bazel-pkg-tool
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/lint-bazel-pkg-tool.yml'
+      - 'bazel/packaging/tool.go'
+    tags-ignore:
+      - '**'
+  pull_request:
+    paths:
+      - '.github/workflows/lint-bazel-pkg-tool.yml'
+      - 'bazel/packaging/tool.go'
+  merge_group:
+    types: [checks_requested]
+jobs:
+  golangci-lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+          args: --timeout 10m --verbose tool.go
+          working-directory: bazel/packaging

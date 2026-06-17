@@ -1,0 +1,25 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "iotune",
+    srcs = ["iotune.go"],
+    importpath = "github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/iotune",
+    visibility = ["//visibility:public"],
+    deps = select({
+        "@rules_go//go/platform:android": [
+            "//src/go/rpk/pkg/config",
+            "//src/go/rpk/pkg/out",
+            "//src/go/rpk/pkg/tuners",
+            "@com_github_spf13_afero//:afero",
+            "@com_github_spf13_cobra//:cobra",
+        ],
+        "@rules_go//go/platform:linux": [
+            "//src/go/rpk/pkg/config",
+            "//src/go/rpk/pkg/out",
+            "//src/go/rpk/pkg/tuners",
+            "@com_github_spf13_afero//:afero",
+            "@com_github_spf13_cobra//:cobra",
+        ],
+        "//conditions:default": [],
+    }),
+)

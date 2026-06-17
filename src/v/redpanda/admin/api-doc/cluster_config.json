@@ -1,0 +1,258 @@
+{
+  "apiVersion": "0.0.1",
+  "swaggerVersion": "1.2",
+  "basePath": "/v1",
+  "resourcePath": "/cluster_config",
+  "produces": [
+    "application/json"
+  ],
+  "apis": [
+    {
+      "path": "/v1/cluster_config",
+      "operations": [
+        {"method": "PUT",
+          "summary": "Update cluster configuration",
+          "type": "void",
+          "nickname": "patch_cluster_config",
+          "produces": ["application/json"],
+          "parameters": [
+            {
+              "in": "query",
+              "name": "force",
+              "schema": {"type": "integer"},
+              "required": false,
+              "description": "If nonzero, skip validation of properties, and permit setting unknown properties"
+            },
+            {
+              "in": "query",
+              "name": "dry_run",
+              "schema": {"type": "integer"},
+              "required": false,
+              "description": "If nonzero, do not apply any changes (but still do validation and return 400 on errors)"
+            },
+            {
+              "in": "body",
+              "required": true,
+              "schema": {
+                "$ref": "#/definitions/patch_cluster_config_request"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "OK"
+            },
+            "400": {
+              "description": "Invalid properties.  Response is a map of property name to error string",
+              "schema":{
+                "type": "object"
+              }
+            }
+          }
+        },
+        {"method": "GET",
+          "summary": "Read cluster configuration",
+          "type": "void",
+          "nickname": "get_cluster_config",
+          "produces": ["application/json"],
+          "parameters": [
+            {
+              "name": "key",
+              "in": "query",
+              "schema": {"type": "string"},
+              "required": false,
+              "allowMultiple": false,
+             "description": "The name of the (sole) property to read from the config. Respects property aliases."
+            },
+            {
+              "name": "include_defaults",
+              "in": "query",
+              "schema": {"type": "boolean"},
+              "required": false,
+              "allowMultiple": false,
+              "description": "If false, only properties which have been changed from the default are included."
+            },
+            {
+              "name": "suppress_pending",
+              "in": "query",
+              "schema": {"type": "boolean"},
+              "required": false,
+              "allowMultiple": false,
+                "description": "If set, report the active runtime values for all configs. By default, properties with pending values (awaiting restart) report the pending value."
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "OK"
+            },
+            "400": {
+              "description": "Invalid properties.  Response is a map of property name to error string",
+              "schema":{
+                "type": "object"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "path": "/v1/cluster_config/status",
+      "operations": [
+        {"method": "GET",
+          "summary": "Get configuration status of nodes",
+          "type": "array",
+          "items": {
+            "type": "cluster_config_status"
+          },
+          "nickname": "get_cluster_config_status",
+          "produces": ["application/json"],
+          "parameters": [
+            {
+              "name": "show_pending",
+              "in": "query",
+              "schema": {"type": "boolean"},
+              "required": false,
+              "allowMultiple": false,
+              "description": "If true, include the list of configs awaiting restart to apply pending values."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "path": "/v1/cluster_config/schema",
+      "operations": [
+        {"method": "GET",
+          "summary": "Get schema describing all cluster configuration properties",
+          "type": "object",
+          "properties": {
+            "properties": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "nickname": "get_cluster_config_schema",
+          "produces": ["application/json"],
+          "parameters": [
+          ]
+        }
+      ]
+    }
+  ],
+  "models": {
+    "cluster_config_status": {
+      "id": "cluster_config_status",
+      "description": "Per-node configuration status",
+      "properties": {
+        "node_id": {
+          "type": "long",
+          "description": "node id"
+        },
+        "restart": {
+          "type": "boolean",
+          "description": "Restart required to apply pending configuration"
+        },
+        "config_version": {
+          "type": "long",
+          "description": "Configuration version number, for cross referencing with PUT results"
+        },
+        "invalid": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "List of properties with invalid values"
+        },
+        "unknown": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "List of properties unknown to this node"
+        },
+        "pending": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "List of properties with pending changes awaiting restart. Only populated for the node serving the request; for other nodes this list is empty."
+        }
+      }
+    },
+    "cluster_config_write_result": {
+      "id": "cluster_config_write_result",
+      "description": "Result of writing changes to cluster configuration",
+      "properties": {
+        "config_version": {
+          "type": "long",
+          "description": "Configuration version number, for cross referencing with node config status"
+        }
+      }
+    },
+    "cluster_config_property_metadata_items": {
+      "id": "cluster_config_property_metadata_items",
+      "description": "The type within 'items' for array properties",
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "A scalar type name, like 'string'"
+        }
+      }
+    },
+    "cluster_config_property_metadata": {
+      "id": "cluster_config_property_metadata",
+      "description": "A single configuration property's metadata",
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Human readable description of property's purpose"
+        },
+        "nullable": {
+          "type": "boolean",
+          "description": "Whether this setting may be set to null"
+        },
+        "needs_restart": {
+          "type": "boolean",
+          "description": "Whether changes to this property will require a restart of redpanda nodes"
+        },
+        "visibility": {
+          "type": "string",
+          "description": "One of user|tunable|deprecated"
+        },
+        "is_secret": {
+          "type": "boolean",
+          "description": "Whether this property is a secret (i.e. should not be logged)"
+        },
+        "units": {
+          "type": "string",
+          "description": "If applicable, the units of the property (e.g. ms, bytes)",
+          "nullable": true
+        },
+        "example": {
+          "type": "string",
+          "description": "Example of correct syntax for this property",
+          "nullable": true
+        },
+        "type": {
+          "type": "string",
+          "description": "Expected syntax of the property value"
+        },
+        "enum_values": {
+          "type": "array",
+          "description": "Possible values of the property (in string-ized form)",
+          "items": {"type": "string"}
+        },
+        "items": {
+          "type": "cluster_config_property_metadata_items",
+          "description": "Type of items in an array",
+          "nullable": true
+        },
+        "aliases": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "List of legacy names for the property.  Property may be set using these names, but will always appear in GET requests via its primary name."
+        }
+      }
+    }
+  }
+}

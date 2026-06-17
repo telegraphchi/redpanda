@@ -1,0 +1,255 @@
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Use of this software is governed by the Business Source License
+ * included in the file licenses/BSL.md
+ *
+ * As of the Change Date specified in that file, in accordance with
+ * the Business Source License, use of this software will be governed
+ * by the Apache License, Version 2.0
+ */
+
+#pragma once
+
+#include "base/format_to.h"
+#include "base/seastarx.h"
+#include "cluster/fwd.h"
+#include "utils/named_type.h"
+
+#include <seastar/core/sharded.hh>
+#include <seastar/core/sstring.hh>
+
+#include <utility>
+#include <variant>
+
+namespace kafka {
+
+using k_client_id = named_type<ss::sstring, struct k_client_id_tag>;
+using k_group_name = named_type<ss::sstring, struct k_group_name_tag>;
+using k_user = named_type<ss::sstring, struct k_user_tag>;
+using k_not_applicable
+  = named_type<std::monostate, struct k_not_applicable_tag>;
+
+/// tracker_key is the we use to key into the client quotas map
+///
+/// Note: while the limits applicable to a single tracker_key are always going
+/// to be the same, it is not guaranteed that a client id will have the same
+/// tracker_key for different types of kafka requests (produce/fetch/partition
+/// mutations). For examples, refer to the unit tests.
+///
+/// Note: the tracker_key is different from the entity_key used to configure
+/// client quotas. The tracker_key defines the granularity at which we track
+/// quotas, whereas the quota limits might be defined more broadly.
+/// For example, if the default client quota applies to the request, the
+/// tracker_key may be client id specific even though the matching entity_key is
+/// the default client quota. In this case, we may have multiple independent
+/// rate trackers for each unique client with all of these rate tracking having
+/// the same shared quota limit
+using tracker_key = std::variant<
+  std::pair<k_user, k_client_id>,
+  std::pair<k_user, k_group_name>,
+  k_user,
+  k_client_id,
+  k_group_name,
+  k_not_applicable>;
+
+std::ostream& operator<<(std::ostream&, const tracker_key&);
+
+/// client_quota_limits describes the limits applicable to a tracker_key
+struct client_quota_limits {
+    std::optional<uint64_t> produce_limit;
+    std::optional<uint64_t> fetch_limit;
+    std::optional<uint64_t> partition_mutation_limit;
+
+    friend bool operator==(
+      const client_quota_limits&, const client_quota_limits&) = default;
+    fmt::iterator format_to(fmt::iterator it) const;
+};
+
+enum class client_quota_type {
+    produce_quota,
+    fetch_quota,
+    partition_mutation_quota
+};
+
+inline constexpr std::array all_client_quota_types = {
+  client_quota_type::produce_quota,
+  client_quota_type::fetch_quota,
+  client_quota_type::partition_mutation_quota};
+
+inline fmt::iterator format_to(client_quota_type t, fmt::iterator out) {
+    switch (t) {
+    case client_quota_type::produce_quota:
+        return fmt::format_to(out, "produce_quota");
+    case client_quota_type::fetch_quota:
+        return fmt::format_to(out, "fetch_quota");
+    case client_quota_type::partition_mutation_quota:
+        return fmt::format_to(out, "partition_mutation_quota");
+    }
+}
+
+struct client_quota_request_ctx {
+    client_quota_type q_type;
+    std::optional<std::string_view> user;
+    std::optional<std::string_view> client_id;
+
+    fmt::iterator format_to(fmt::iterator it) const;
+};
+
+/// client_quota_rule is used for reporting metrics to show which type of rule
+/// is being used for limiting clients
+enum class client_quota_rule {
+    not_applicable,
+    kafka_client_default,
+    kafka_client_prefix,
+    kafka_client_id,
+    kafka_user_default,
+    kafka_user_default_client_default,
+    kafka_user_default_client_prefix,
+    kafka_user_default_client_id,
+    kafka_user,
+    kafka_user_client_default,
+    kafka_user_client_prefix,
+    kafka_user_client_id
+};
+
+inline constexpr std::array all_client_quota_rules = {
+  client_quota_rule::not_applicable,
+  client_quota_rule::kafka_client_default,
+  client_quota_rule::kafka_client_prefix,
+  client_quota_rule::kafka_client_id,
+  client_quota_rule::kafka_user_default,
+  client_quota_rule::kafka_user_default_client_default,
+  client_quota_rule::kafka_user_default_client_prefix,
+  client_quota_rule::kafka_user_default_client_id,
+  client_quota_rule::kafka_user,
+  client_quota_rule::kafka_user_client_default,
+  client_quota_rule::kafka_user_client_prefix,
+  client_quota_rule::kafka_user_client_id};
+
+inline fmt::iterator format_to(client_quota_rule r, fmt::iterator out) {
+    switch (r) {
+    case client_quota_rule::not_applicable:
+        return fmt::format_to(out, "not_applicable");
+    case client_quota_rule::kafka_client_default:
+        return fmt::format_to(out, "kafka_client_default");
+    case client_quota_rule::kafka_client_prefix:
+        return fmt::format_to(out, "kafka_client_prefix");
+    case client_quota_rule::kafka_client_id:
+        return fmt::format_to(out, "kafka_client_id");
+    case client_quota_rule::kafka_user_default:
+        return fmt::format_to(out, "kafka_user_default");
+    case client_quota_rule::kafka_user_default_client_default:
+        return fmt::format_to(out, "kafka_user_default_client_default");
+    case client_quota_rule::kafka_user_default_client_prefix:
+        return fmt::format_to(out, "kafka_user_default_client_prefix");
+    case client_quota_rule::kafka_user_default_client_id:
+        return fmt::format_to(out, "kafka_user_default_client_id");
+    case client_quota_rule::kafka_user:
+        return fmt::format_to(out, "kafka_user");
+    case client_quota_rule::kafka_user_client_default:
+        return fmt::format_to(out, "kafka_user_client_default");
+    case client_quota_rule::kafka_user_client_prefix:
+        return fmt::format_to(out, "kafka_user_client_prefix");
+    case client_quota_rule::kafka_user_client_id:
+        return fmt::format_to(out, "kafka_user_client_id");
+    }
+}
+
+struct client_quota_value {
+    std::optional<uint64_t> limit;
+    client_quota_rule rule;
+
+    fmt::iterator format_to(fmt::iterator it) const;
+};
+
+/// client_quota_translator is responsible for providing quota_manager with a
+/// simplified interface to the quota configurations
+///  * It is responsible for translating the quota-specific request context (for
+///  now the client.id header field) into the applicable tracker_key.
+///  * It is also responsible for finding the quota limits of a tracker_key
+class client_quota_translator {
+public:
+    using on_change_fn = std::function<void()>;
+
+    explicit client_quota_translator(
+      ss::sharded<cluster::client_quota::store>&);
+
+    /// Returns the quota tracker key applicable to the given quota context
+    /// Note: because the client quotas configured for produce/fetch/pm might be
+    /// different, the tracker_key for produce/fetch/pm might be different
+    tracker_key find_quota_key(const client_quota_request_ctx& ctx) const;
+
+    /// Finds the limits applicable to the given quota tracker key
+    client_quota_limits find_quota_value(const tracker_key&) const;
+
+    /// Returns the quota tracker key and value. If no quota applies to the
+    /// given context, the value may have an empty limit with the rule
+    /// not_applicable
+    std::pair<tracker_key, client_quota_value>
+    find_quota(const client_quota_request_ctx& ctx) const;
+
+    /// Returns the quota rule type that applies to the given tracker key and
+    /// quota type
+    client_quota_rule
+    find_quota_rule(const tracker_key&, client_quota_type) const;
+
+    /// `watch` can be used to register for quota changes
+    void watch(on_change_fn&& fn);
+
+    /// Returns true if there are no quotas configured
+    bool is_empty() const;
+
+private:
+    client_quota_value get_client_quota_value(
+      const tracker_key& quota_id, client_quota_type qt) const;
+
+    ss::sharded<cluster::client_quota::store>& _quota_store;
+};
+
+} // namespace kafka
+
+template<>
+struct fmt::formatter<kafka::tracker_key> {
+    constexpr auto parse(fmt::format_parse_context& ctx) const {
+        return ctx.begin();
+    }
+
+    template<typename Ctx>
+    auto format(const kafka::tracker_key& key, Ctx& ctx) const {
+        return std::visit(
+          [&ctx](const auto& value) {
+              using value_t = std::remove_cvref_t<decltype(value)>;
+              if constexpr (
+                std::is_same_v<
+                  value_t,
+                  std::pair<kafka::k_user, kafka::k_client_id>>) {
+                  return fmt::format_to(
+                    ctx.out(),
+                    "k_user{{{}}}, k_client_id{{{}}}",
+                    value.first,
+                    value.second);
+              } else if constexpr (
+                std::is_same_v<
+                  value_t,
+                  std::pair<kafka::k_user, kafka::k_group_name>>) {
+                  return fmt::format_to(
+                    ctx.out(),
+                    "k_user{{{}}}, k_group_name{{{}}}",
+                    value.first,
+                    value.second);
+              } else if constexpr (std::is_same_v<value_t, kafka::k_user>) {
+                  return fmt::format_to(ctx.out(), "k_user{{{}}}", value);
+              } else if constexpr (
+                std::is_same_v<value_t, kafka::k_client_id>) {
+                  return fmt::format_to(ctx.out(), "k_client_id{{{}}}", value);
+              } else if constexpr (
+                std::is_same_v<value_t, kafka::k_group_name>) {
+                  return fmt::format_to(ctx.out(), "k_group_name{{{}}}", value);
+              } else {
+                  return fmt::format_to(ctx.out(), "k_not_applicable");
+              }
+          },
+          key);
+    }
+};

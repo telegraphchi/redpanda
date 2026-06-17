@@ -1,0 +1,275 @@
+/*
+ * Copyright 2021 Redpanda Data, Inc.
+ *
+ * Use of this software is governed by the Business Source License
+ * included in the file licenses/BSL.md
+ *
+ * As of the Change Date specified in that file, in accordance with
+ * the Business Source License, use of this software will be governed
+ * by the Apache License, Version 2.0
+ */
+
+#pragma once
+
+#include "base/outcome.h"
+#include "pandaproxy/schema_registry/error.h"
+#include "pandaproxy/schema_registry/exceptions.h"
+#include "pandaproxy/schema_registry/types.h"
+
+#include <fmt/format.h>
+
+namespace pandaproxy::schema_registry {
+
+/// \brief error_info stores an error_code and custom message.
+///
+/// This class is useful for transporting via an outcome::result
+/// and automatic conversion to an `exception`.
+/// See `outcome_throw_as_system_error_with_payload`.
+class error_info {
+public:
+    error_info() = default;
+    error_info(error_code ec, std::string msg)
+      : _ec{ec}
+      , _msg{std::move(msg)} {}
+
+    const error_code& code() const noexcept { return _ec; }
+    const std::string& message() const noexcept { return _msg; }
+
+private:
+    error_code _ec;
+    std::string _msg;
+};
+
+inline exception as_exception(const error_info& ei) {
+    return exception(ei.code(), ei.message());
+}
+
+///\brief Integrate error_info with outcome
+inline std::error_code make_error_code(const error_info& ei) {
+    return make_error_code(ei.code());
+}
+
+///\brief Integrate error_info with outcome
+inline void outcome_throw_as_system_error_with_payload(const error_info& ei) {
+    throw as_exception(ei);
+}
+
+template<typename T>
+using result = result<T, error_info>;
+
+inline error_info schema_not_found() {
+    return error_info{
+      error_code::schema_id_not_found, fmt::format("Schema not found")};
+}
+
+inline error_info not_found(schema_id id) {
+    return error_info{
+      error_code::schema_id_not_found,
+      fmt::format("Schema {} not found", id())};
+}
+
+inline error_info not_found(const context_subject& sub) {
+    return error_info{
+      error_code::subject_not_found,
+      fmt::format("Subject '{}' not found.", sub)};
+}
+
+inline error_info not_found(const context_subject& sub, mode) {
+    return error_info{
+      error_code::mode_not_found,
+      fmt::format(
+        "Subject '{}' does not have subject-level mode configured.", sub)};
+}
+
+inline error_info not_found(const context_subject&, schema_version version) {
+    return error_info{
+      error_code::subject_version_not_found,
+      fmt::format("Version {} not found.", version())};
+}
+
+inline error_info soft_deleted(const context_subject& sub) {
+    return error_info{
+      error_code::subject_soft_deleted,
+      fmt::format(
+        "Subject '{}' was soft deleted.Set permanent=true to delete "
+        "permanently",
+        sub)};
+}
+
+inline error_info not_deleted(const context_subject& sub) {
+    return error_info{
+      error_code::subject_not_deleted,
+      fmt::format(
+        "Subject '{}' was not deleted first before being permanently deleted",
+        sub)};
+}
+
+inline error_info
+soft_deleted(const context_subject& sub, schema_version version) {
+    return error_info{
+      error_code::subject_version_soft_deleted,
+      fmt::format(
+        "Subject '{}' Version {} was soft deleted.Set permanent=true to "
+        "delete permanently",
+        sub,
+        version())};
+}
+
+inline error_info
+not_deleted(const context_subject& sub, schema_version version) {
+    return error_info{
+      error_code::subject_version_not_deleted,
+      fmt::format(
+        "Subject '{}' Version {} was not deleted first before being "
+        "permanently deleted",
+        sub,
+        version())};
+}
+
+inline error_info invalid_schema_type(schema_type type) {
+    return {
+      error_code::schema_invalid,
+      fmt::format("Invalid schema type {}", to_string_view(type))};
+}
+
+inline error_info schema_version_invalid(ss::sstring v) {
+    return {
+      error_code::schema_version_invalid,
+      fmt::format(
+        "The specified version '{}' is not a valid version id. Allowed values "
+        "are between [1, 2^31-1] and the string \"latest\"",
+        v)};
+}
+
+inline error_info invalid_subject_schema(const context_subject& sub) {
+    return {
+      error_code::subject_schema_invalid,
+      fmt::format("Error while looking up schema under subject {}", sub)};
+}
+
+inline error_info invalid_schema(const subject_schema& schema) {
+    return {
+      error_code::schema_invalid, fmt::format("Invalid schema {}", schema)};
+}
+
+inline error_info invalid_schema(std::string msg) {
+    return {error_code::schema_invalid, std::move(msg)};
+}
+
+inline error_info
+has_references(const context_subject& sub, schema_version ver) {
+    return {
+      error_code::subject_version_has_references,
+      fmt::format(
+        "One or more references exist to the schema "
+        "{{magic=1,keytype=SCHEMA,subject={},version={}}}",
+        sub,
+        ver())};
+}
+
+error_info no_reference_found_for(
+  const subject_schema& schema, const context_subject& sub, schema_version ver);
+
+inline error_info compatibility_not_found(const context& ctx) {
+    return error_info{
+      error_code::compatibility_not_found,
+      fmt::format(
+        "Context '{}' does not have context-level compatibility configured",
+        ctx)};
+}
+
+inline error_info compatibility_not_found(const context_subject& sub) {
+    return error_info{
+      error_code::compatibility_not_found,
+      fmt::format(
+        "Subject '{}' does not have subject-level compatibility configured",
+        sub)};
+}
+
+inline error_info mode_not_found(const context& ctx) {
+    return error_info{
+      error_code::mode_not_found,
+      fmt::format(
+        "Context '{}' does not have context-level mode configured", ctx)};
+}
+
+inline error_info mode_not_found(const context_subject& sub) {
+    return error_info{
+      error_code::mode_not_found,
+      fmt::format(
+        "Subject '{}' does not have subject-level mode configured", sub)};
+}
+
+inline error_info mode_not_readwrite(const context_subject& sub) {
+    return error_info{
+      error_code::subject_version_operation_not_permitted,
+      fmt::format("Subject {} is not in read-write mode", sub)};
+}
+
+inline error_info mode_not_import(const context_subject& sub) {
+    return error_info{
+      error_code::subject_version_operation_not_permitted,
+      fmt::format("Subject {} is not in import mode", sub)};
+}
+
+inline error_info
+mode_is_readonly(const context& ctx, const std::optional<subject>& sub) {
+    return error_info{
+      error_code::subject_version_operation_not_permitted,
+      fmt::format(
+        "Subject {} in context {} is in read-only mode",
+        sub.value_or(subject{"null"}),
+        ctx)};
+}
+
+inline error_info mode_is_readonly(const context_subject& ctx) {
+    return mode_is_readonly(ctx.ctx, ctx.sub);
+}
+
+inline error_info versions_exhausted(const context_subject& sub) {
+    return error_info{
+      error_code::version_exhausted,
+      fmt::format("Versions exhausted for subject {}", sub)};
+}
+
+inline error_info format_not_supported(const output_format f) {
+    return error_info{
+      error_code::format_not_supported,
+      fmt::format("Format value '{}' is not supported", f)};
+}
+
+inline error_info overwrite_schema_with_id_not_permitted(schema_id id) {
+    return error_info{
+      error_code::subject_version_operation_not_permitted,
+      fmt::format("Overwrite new schema with id {} is not permitted.", id())};
+}
+
+inline error_info writes_disabled() {
+    return error_info{
+      error_code::writes_disabled, "Writes to Schema Registry are disabled"};
+}
+
+inline error_info subject_invalid(std::string_view subject) {
+    return error_info{
+      error_code::subject_invalid,
+      fmt::format("The specified subject '{}' is not valid.", subject)};
+}
+
+inline error_info context_not_empty(const context& ctx) {
+    return error_info{
+      error_code::context_not_empty,
+      fmt::format("The specified context '{}' is not empty.", ctx())};
+}
+
+inline error_info context_invalid(std::string_view ctx) {
+    return error_info{
+      error_code::context_invalid,
+      fmt::format("The specified context '{}' is not valid.", ctx)};
+}
+
+inline bool failed_subject_schema_lookup(std::error_code ec) {
+    return ec == error_code::subject_not_found
+           || ec == error_code::subject_version_not_found;
+}
+
+} // namespace pandaproxy::schema_registry

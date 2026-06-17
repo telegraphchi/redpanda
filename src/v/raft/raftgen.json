@@ -1,0 +1,50 @@
+{
+    "namespace": "raft",
+    "service_name": "raftgen",
+    "includes": [
+        "raft/types.h",
+        "raft/heartbeats.h"
+    ],
+    "methods": [
+        {
+            "name": "vote",
+            "input_type": "vote_request",
+            "output_type": "vote_reply"
+        },
+        {
+            "name": "append_entries",
+            "input_type": "append_entries_request",
+            "output_type": "append_entries_reply"
+        },
+        {
+            "name": "heartbeat_v2",
+            "input_type": "heartbeat_request_v2",
+            "output_type": "heartbeat_reply_v2"
+        },
+        {
+            "name": "install_snapshot",
+            "input_type": "install_snapshot_request",
+            "output_type": "install_snapshot_reply"
+        },
+        {
+            "name": "timeout_now",
+            "input_type": "timeout_now_request",
+            "output_type": "timeout_now_reply"
+        },
+        {
+            "name": "append_entries_full_serde",
+            "input_type": "append_entries_request_serde_wrapper",
+            "output_type": "append_entries_reply"
+        },
+        {
+            "name": "get_compaction_mcco",
+            "input_type": "get_compaction_mcco_request",
+            "output_type": "get_compaction_mcco_reply"
+        },
+        {
+            "name": "distribute_compaction_mtro",
+            "input_type": "distribute_compaction_mtro_request",
+            "output_type": "distribute_compaction_mtro_reply"
+        }
+    ]
+}

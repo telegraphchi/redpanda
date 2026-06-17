@@ -1,0 +1,22 @@
+load("//bazel:build.bzl", "redpanda_cc_library")
+
+redpanda_cc_library(
+    name = "stm",
+    srcs = [
+        "transform_offsets_stm.cc",
+    ],
+    hdrs = [
+        "transform_offsets_stm.h",
+    ],
+    implementation_deps = [
+        "//src/v/cluster",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/v/cluster:distributed_kv_stm",
+        "//src/v/cluster:state_machine_registry",
+        "//src/v/cluster:topic_table",
+        "//src/v/model",
+        "@seastar",
+    ],
+)

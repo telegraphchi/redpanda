@@ -1,0 +1,87 @@
+version: '3'
+
+networks:
+  redpanda-test:
+    name: redpanda-test
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.215.0/24
+
+services:
+  dns:
+    restart: always
+    build: ./dns
+    volumes:
+      - ./dns/dnsmasq.conf:/etc/dnsmasq.conf
+    cap_add:
+      - NET_ADMIN
+    networks:
+      redpanda-test:
+        ipv4_address: 192.168.215.126
+  minio:
+    command: server /data
+    container_name: minio-s3
+    environment:
+      MINIO_DOMAIN: minio-s3
+      MINIO_REGION_NAME: panda-region
+      MINIO_ROOT_PASSWORD: panda-secret
+      MINIO_ROOT_USER: panda-user
+      MINIO_BROWSER: "off"
+    expose:
+    - '9000'
+    healthcheck:
+      interval: 30s
+      retries: 3
+      test:
+      - CMD
+      - curl
+      - -f
+      - http://localhost:9000/minio/health/live
+      timeout: 20s
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    networks:
+      redpanda-test:
+        ipv4_address: 192.168.215.125
+  mysql:
+    image: mysql:9.3.0
+    restart: always
+    expose:
+    - '3306'
+    environment:
+      MYSQL_ROOT_PASSWORD: panda-secret
+    volumes:
+    - ./mysql-init:/docker-entrypoint-initdb.d
+    networks:
+    - redpanda-test
+  azurite:
+    container_name: azurite
+    restart: always
+    command: "azurite-blob -l /data --blobHost 0.0.0.0"
+    expose:
+    - '10000'
+    # image: mcr.microsoft.com/azure-storage/azurite:3.34.0
+    image: public.ecr.aws/l9j0i2e0/azurite-no-leaks:latest
+    environment:
+      AZURITE_DB: mysql://root:panda-secret@mysql:3306/azurite_blob
+    networks:
+    - redpanda-test
+  rp:
+    image: ${RP_TEST_NODE_IMAGE:-vectorized/redpanda-test-node}
+    privileged: true
+    pids_limit: 32768
+    ulimits:
+      nofile:
+        soft: 131072
+        hard: 131072
+    sysctls:
+      net.ipv4.ip_local_port_range: 34000 60999
+    depends_on: 
+    - minio
+    volumes:
+    - '${BUILD_ROOT}:${BUILD_ROOT}'
+    - '${BUILD_ROOT}/redpanda_installs:/opt/redpanda_installs'
+    networks:
+    - redpanda-test
+    dns:
+      - 192.168.215.126

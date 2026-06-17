@@ -1,0 +1,268 @@
+load("//bazel:test.bzl", "redpanda_cc_bench", "redpanda_cc_gtest", "redpanda_test_cc_library")
+
+redpanda_test_cc_library(
+    name = "logger",
+    hdrs = ["wasm_logger.h"],
+    deps = [
+        "//src/v/base",
+        "//src/v/wasm:wasi_logger",
+        "@seastar",
+    ],
+)
+
+redpanda_test_cc_library(
+    name = "wasm_fixture",
+    srcs = ["wasm_fixture.cc"],
+    hdrs = ["wasm_fixture.h"],
+    deps = [
+        ":logger",
+        "//src/v/base",
+        "//src/v/bytes",
+        "//src/v/model",
+        "//src/v/model/tests:random",
+        "//src/v/pandaproxy/schema_registry:types",
+        "//src/v/schema:registry",
+        "//src/v/schema/tests:fake_registry",
+        "//src/v/serde",
+        "//src/v/storage:record_batch_builder",
+        "//src/v/test_utils:gtest",
+        "//src/v/test_utils:random_bytes",
+        "//src/v/test_utils:runfiles",
+        "//src/v/wasm:api",
+        "//src/v/wasm:transform_probe",
+        "//src/v/wasm:wasmtime",
+        "@abseil-cpp//absl/strings",
+        "@fmt",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "wasm_allocator_test",
+    timeout = "short",
+    srcs = [
+        "wasm_allocator_test.cc",
+    ],
+    cpu = 1,
+    memory = "64MiB",
+    deps = [
+        "//src/v/base",
+        "//src/v/test_utils:gtest",
+        "//src/v/wasm:allocator",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "ffi_helpers_test",
+    timeout = "short",
+    srcs = [
+        "ffi_helpers_test.cc",
+    ],
+    cpu = 1,
+    memory = "32MiB",
+    deps = [
+        "//src/v/base",
+        "//src/v/bytes:random",
+        "//src/v/model",
+        "//src/v/random:generators",
+        "//src/v/test_utils:gtest",
+        "//src/v/test_utils:random_bytes",
+        "//src/v/wasm:ffi",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+filegroup(
+    name = "wasm_test_assets",
+    srcs = [
+        "//src/transform-sdk/go/transform/internal/testdata/dynamic",
+        "//src/transform-sdk/go/transform/internal/testdata/identity",
+        "//src/transform-sdk/go/transform/internal/testdata/schema-registry",
+        "//src/transform-sdk/go/transform/internal/testdata/setup-panic",
+        "//src/transform-sdk/go/transform/internal/testdata/transform-error",
+        "//src/transform-sdk/go/transform/internal/testdata/transform-panic",
+        "//src/transform-sdk/go/transform/internal/testdata/wasi",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "wasi_test",
+    timeout = "moderate",
+    srcs = [
+        "wasi_test.cc",
+    ],
+    cpu = 1,
+    data = [":wasm_test_assets"],
+    memory = "128MiB",
+    deps = [
+        ":wasm_fixture",
+        "//src/v/base",
+        "//src/v/bytes:iobuf",
+        "//src/v/bytes:iobuf_parser",
+        "//src/v/json",
+        "//src/v/model",
+        "//src/v/test_utils:gtest",
+        "//src/v/wasm:wasi",
+        "@abseil-cpp//absl/container:flat_hash_set",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "wasm_transform_test",
+    timeout = "long",
+    srcs = [
+        "wasm_transform_test.cc",
+    ],
+    cpu = 1,
+    data = [":wasm_test_assets"],
+    memory = "128MiB",
+    deps = [
+        ":wasm_fixture",
+        "//src/v/base",
+        "//src/v/test_utils:gtest",
+        "//src/v/wasm:api",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "wasm_sr_test",
+    timeout = "moderate",
+    srcs = [
+        "wasm_sr_test.cc",
+    ],
+    cpu = 1,
+    data = [":wasm_test_assets"],
+    memory = "128MiB",
+    deps = [
+        ":wasm_fixture",
+        "//src/v/base",
+        "//src/v/bytes",
+        "//src/v/bytes:iobuf",
+        "//src/v/bytes:streambuf",
+        "//src/v/model",
+        "//src/v/pandaproxy/schema_registry:types",
+        "//src/v/test_utils:gtest",
+        "//src/v/wasm:api",
+        "@avro",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "wasm_lifecycle_test",
+    timeout = "long",
+    srcs = [
+        "wasm_lifecycle_test.cc",
+    ],
+    cpu = 1,
+    data = [":wasm_test_assets"],
+    memory = "128MiB",
+    deps = [
+        ":wasm_fixture",
+        "//src/v/base",
+        "//src/v/pandaproxy",
+        "//src/v/test_utils:gtest",
+        "//src/v/wasm:api",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "wasm_resources_test",
+    timeout = "moderate",
+    srcs = [
+        "wasm_resources_test.cc",
+    ],
+    cpu = 1,
+    data = [":wasm_test_assets"],
+    memory = "128MiB",
+    deps = [
+        ":wasm_fixture",
+        "//src/v/base",
+        "//src/v/test_utils:gtest",
+        "//src/v/wasm:api",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "wasm_cache_test",
+    timeout = "short",
+    srcs = [
+        "wasm_cache_test.cc",
+    ],
+    cpu = 2,
+    memory = "64MiB",
+    deps = [
+        "//src/v/base",
+        "//src/v/model",
+        "//src/v/model/tests:random",
+        "//src/v/random:generators",
+        "//src/v/ssx:future_util",
+        "//src/v/test_utils:gtest",
+        "//src/v/test_utils:random_bytes",
+        "//src/v/wasm:api",
+        "//src/v/wasm:cache",
+        "//src/v/wasm:wasi_logger",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_gtest(
+    name = "wasm_probe_test",
+    timeout = "short",
+    srcs = [
+        "wasm_probe_test.cc",
+    ],
+    deps = [
+        "//src/v/base",
+        "//src/v/metrics",
+        "//src/v/model",
+        "//src/v/test_utils:gtest",
+        "//src/v/test_utils:metrics",
+        "//src/v/wasm:engine_probe",
+        "//src/v/wasm:logger",
+        "@googletest//:gtest",
+        "@seastar",
+    ],
+)
+
+redpanda_cc_bench(
+    name = "wasm_transform_rpbench",
+    timeout = "long",
+    srcs = [
+        "wasm_transform_bench.cc",
+    ],
+    cpu = 1,
+    data = [":wasm_test_assets"],
+    memory = "512MiB",
+    deps = [
+        ":logger",
+        "//src/v/base",
+        "//src/v/model",
+        "//src/v/model/tests:random",
+        "//src/v/schema:registry",
+        "//src/v/ssx:future_util",
+        "//src/v/test_utils:random",
+        "//src/v/test_utils:runfiles",
+        "//src/v/wasm:api",
+        "//src/v/wasm:logger",
+        "//src/v/wasm:transform_probe",
+        "//src/v/wasm:wasmtime",
+        "@abseil-cpp//absl/strings",
+        "@seastar",
+        "@seastar//:benchmark",
+    ],
+)

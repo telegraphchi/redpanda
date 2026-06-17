@@ -1,0 +1,1015 @@
+/*
+ * Copyright 2022 Redpanda Data, Inc.
+ *
+ * Use of this software is governed by the Business Source License
+ * included in the file licenses/BSL.md
+ *
+ * As of the Change Date specified in that file, in accordance with
+ * the Business Source License, use of this software will be governed
+ * by the Apache License, Version 2.0
+ */
+
+#include "feature_manager.h"
+
+#include "cluster/commands.h"
+#include "cluster/controller_service.h"
+#include "cluster/controller_utils.h"
+#include "cluster/health_monitor_backend.h"
+#include "cluster/health_monitor_frontend.h"
+#include "cluster/health_monitor_types.h"
+#include "cluster/logger.h"
+#include "cluster/members_table.h"
+#include "config/configuration.h"
+#include "config/endpoint_tls_config.h"
+#include "config/node_config.h"
+#include "config/sasl_mechanisms.h"
+#include "config/tls_config.h"
+#include "config/types.h"
+#include "config/validators.h"
+#include "features/enterprise_feature_messages.h"
+#include "features/feature_state.h"
+#include "features/feature_table.h"
+#include "model/timeout_clock.h"
+#include "pandaproxy/schema_registry/schema_id_validation.h"
+#include "raft/group_manager.h"
+#include "rpc/connection_cache.h"
+#include "security/role_store.h"
+#include "security/types.h"
+
+#include <seastar/core/semaphore.hh>
+
+#include <fmt/format.h>
+
+#include <algorithm>
+#include <stdexcept>
+
+namespace cluster {
+
+static constexpr std::chrono::seconds status_retry = 5s;
+
+feature_manager::feature_manager(
+  ss::sharded<controller_stm>& stm,
+  ss::sharded<ss::abort_source>& as,
+  ss::sharded<members_table>& members,
+  ss::sharded<raft::group_manager>& group_manager,
+  ss::sharded<health_monitor_frontend>& hm_frontend,
+  ss::sharded<health_monitor_backend>& hm_backend,
+  ss::sharded<features::feature_table>& table,
+  ss::sharded<rpc::connection_cache>& connection_cache,
+  ss::sharded<security::role_store>& role_store,
+  ss::sharded<topic_table>& topic_table,
+  raft::group_id raft0_group)
+  : _stm(stm)
+  , _as(as)
+  , _members(members)
+  , _group_manager(group_manager)
+  , _hm_frontend(hm_frontend)
+  , _hm_backend(hm_backend)
+  , _feature_table(table)
+  , _connection_cache(connection_cache)
+  , _role_store(role_store)
+  , _topic_table(topic_table)
+  , _raft0_group(raft0_group)
+  , _barrier_state(
+      *config::node().node_id(),
+      members.local(),
+      as.local(),
+      _gate,
+      [this](
+        model::node_id from,
+        model::node_id to,
+        feature_barrier_tag tag,
+        bool entered)
+        -> ss::future<result<rpc::client_context<feature_barrier_response>>> {
+          auto timeout = 5s;
+          return _connection_cache.local()
+            .with_node_client<cluster::controller_client_protocol>(
+              from,
+              ss::this_shard_id(),
+              to,
+              timeout,
+              [from, tag, timeout, entered](
+                controller_client_protocol cp) mutable {
+                  return cp.feature_barrier(
+                    feature_barrier_request{
+                      .tag = tag, .peer = from, .entered = entered},
+                    rpc::client_opts(model::timeout_clock::now() + timeout));
+              });
+      }
+
+    ) {}
+
+ss::future<>
+feature_manager::start(std::vector<model::node_id>&& cluster_founder_nodes) {
+    vlog(clusterlog.info, "Starting...");
+
+    // Register for node health change notifications
+    _health_notify_handle = _hm_backend.local().register_node_callback(
+      [this](
+        const node_health_report& report,
+        std::optional<ss::lw_shared_ptr<const node_health_report>>) {
+          // If we did not know the node's version or if the report is
+          // higher, submit an update.
+          auto i = _node_versions.find(report.id);
+          if (
+            i == _node_versions.end()
+            || i->second < report.local_state.logical_version) {
+              update_node_version(
+                report.id, report.local_state.logical_version);
+          }
+      });
+
+    // Register for leader notifications
+    _leader_notify_handle
+      = _group_manager.local().register_leadership_notification(
+        [this](
+          raft::group_id group,
+          model::term_id term,
+          std::optional<model::node_id> leader_id) {
+            // Should never be called with gate closed: group manager
+            // is shut down: we unregister leader notification before
+            // closing gate.
+            _gate.check();
+
+            if (group != _raft0_group) {
+                return;
+            }
+
+            // On leadership change, clear our map of node versions: this
+            // ensures that we will populate it with fresh data when we next
+            // see a health report from each node.
+            _node_versions.clear();
+
+            // Manual finalization requests are term-scoped: a stale value
+            // carried across leadership changes would be misleading on
+            // re-election. Operators must re-issue against the new leader.
+            _manual_finalize_pending = false;
+
+            vlog(
+              clusterlog.debug, "Controller leader notification term {}", term);
+            const bool am_leader = leader_id == *config::node().node_id();
+            _is_leader_of = am_leader ? std::optional{term} : std::nullopt;
+            // Force the background loop to re-establish a linearizable
+            // barrier on every leadership transition: cluster-config
+            // values it consults must not be read until we have applied
+            // every controller log entry committed at the time we took
+            // leadership.
+            _caught_up_for_term.reset();
+
+            // This hook avoids the need for the controller leader to receive
+            // its own health report to generate a call to update_node_version.
+            // Especially useful on first startup of cluster, where the initial
+            // leader is the only node, and can immediately store the cluster
+            // version based on its own version alone.
+            if (
+              _feature_table.local().get_active_version()
+                != features::feature_table::get_latest_logical_version()
+              && am_leader) {
+                // When I become leader for first time (i.e. when active
+                // version is not known yet, proactively persist it)
+                vlog(
+                  clusterlog.debug,
+                  "generating version update for controller leader {} ({})",
+                  leader_id.value(),
+                  features::feature_table::get_latest_logical_version());
+                update_node_version(
+                  *config::node().node_id(),
+                  features::feature_table::get_latest_logical_version());
+            } else if (am_leader) {
+                // In any case, kick the background update loop when
+                // we gain leadership, in case there is work to do like
+                // auto-activating some features.
+                _update_wait.signal();
+            }
+        });
+
+    // Wake the background loop on any membership change. The active-
+    // version check in do_maybe_update_active_version is gated on the
+    // set of current members (members_table::node_ids()); when a node
+    // is fully removed (e.g. its decommission completes) no health
+    // report or leader change re-triggers the loop, so without this
+    // notification the active version can stay stuck below the
+    // cluster's actual minimum until the next leader change.
+    _members_notify_handle
+      = _members.local().register_members_updated_notification(
+        [this](model::node_id, model::membership_state) {
+            _members_changed = true;
+            _update_wait.signal();
+        });
+
+    // Detach fiber for active version updater.
+    // The writes of active version run in the background, because we
+    // do it in response to callbacks (e.g. node version change from
+    // health monitor) that expect prompt return, so need to do the slower
+    // raft0 write in the background.
+    ssx::background = ssx::spawn_with_gate_then(_gate, [this] {
+                          return ss::do_until(
+                            [this] { return _as.local().abort_requested(); },
+                            [this] { return maybe_update_feature_table(); });
+                      }).handle_exception([](const std::exception_ptr& e) {
+        vlog(clusterlog.warn, "Exception from updater: {}", e);
+    });
+
+    // Detach fiber for alerts of possible license violations or notifications
+    ssx::background = ssx::spawn_with_gate_then(_gate, [this] {
+        return ss::do_until(
+          [this] { return _as.local().abort_requested(); },
+          [this] { return maybe_log_periodic_reminders(); });
+    });
+
+    for (const model::node_id n : cluster_founder_nodes) {
+        set_node_to_latest_version(n);
+    }
+
+    co_return;
+}
+ss::future<> feature_manager::stop() {
+    vlog(clusterlog.info, "Stopping Feature Manager...");
+    _group_manager.local().unregister_leadership_notification(
+      _leader_notify_handle);
+    _hm_backend.local().unregister_node_callback(_health_notify_handle);
+    _members.local().unregister_members_updated_notification(
+      _members_notify_handle);
+    _update_wait.broken();
+    _verified_enterprise_license.broken();
+    co_await _gate.close();
+}
+
+features::enterprise_feature_report
+feature_manager::report_enterprise_features() const {
+    const auto& cfg = config::shard_local_cfg();
+    const auto& node_cfg = config::node();
+    auto has_oidc = []() {
+        return config::oidc_is_enabled_kafka()
+               || config::oidc_is_enabled_http();
+    };
+    auto has_schema_id_validation = [&cfg]() {
+        return cfg.enable_schema_id_validation()
+               != pandaproxy::schema_registry::schema_id_validation_mode::none;
+    };
+    auto fips_enabled = [&node_cfg]() {
+        auto fips_mode = node_cfg.fips_mode();
+        return fips_mode == config::fips_mode_flag::permissive
+               || fips_mode == config::fips_mode_flag::enabled;
+    };
+    auto n_roles = _role_store.local().size();
+    auto has_non_default_roles
+      = n_roles >= 2
+        || (n_roles == 1 && !_role_store.local().contains(security::default_role));
+    auto leadership_pinning_enabled = [&cfg, this]() {
+        const config::leaders_preference no_leaders_preference{};
+        if (cfg.default_leaders_preference() != no_leaders_preference) {
+            return true;
+        }
+        for (const auto& topic : _topic_table.local().topics_map()) {
+            const auto leaders_preference
+              = topic.second.get_configuration().properties.leaders_preference;
+            if (
+              leaders_preference.has_value()
+              && leaders_preference.value() != no_leaders_preference) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    features::enterprise_feature_report report;
+    report.set(
+      features::license_required_feature::audit_logging, cfg.audit_enabled());
+    report.set(
+      features::license_required_feature::cloud_storage,
+      cfg.cloud_storage_enabled());
+    report.set(
+      features::license_required_feature::partition_auto_balancing_continuous,
+      cfg.partition_autobalancing_mode()
+        == model::partition_autobalancing_mode::continuous);
+    report.set(
+      features::license_required_feature::core_balancing_continuous,
+      cfg.core_balancing_continuous());
+    report.set(
+      features::license_required_feature::gssapi,
+      config::has_sasl_mechanism(config::gssapi));
+    report.set(features::license_required_feature::oidc, has_oidc());
+    report.set(
+      features::license_required_feature::schema_id_validation,
+      has_schema_id_validation());
+    report.set(features::license_required_feature::rbac, has_non_default_roles);
+    report.set(features::license_required_feature::fips, fips_enabled());
+    report.set(
+      features::license_required_feature::datalake_iceberg,
+      cfg.iceberg_enabled());
+    report.set(
+      features::license_required_feature::leadership_pinning,
+      leadership_pinning_enabled());
+    report.set(
+      features::license_required_feature::shadow_linking,
+      cfg.enable_shadow_linking());
+    report.set(
+      features::license_required_feature::topic_deletion_disabled,
+      !cfg.delete_topic_enable());
+    return report;
+}
+
+ss::future<> feature_manager::maybe_log_periodic_reminders() {
+    auto reminder_period = std::chrono::seconds(60 * 5);
+    auto interval_override = std::getenv(
+      "__REDPANDA_PERIODIC_REMINDER_INTERVAL_SEC");
+    if (interval_override != nullptr) {
+        try {
+            reminder_period = std::min(
+              std::chrono::seconds{reminder_period},
+              std::chrono::seconds{std::stoi(interval_override)});
+            vlog(
+              clusterlog.info,
+              "Overriding default reminder period interval to: {}s",
+              reminder_period.count());
+        } catch (...) {
+            vlog(
+              clusterlog.error,
+              "Invalid reminder period interval override '{}'",
+              interval_override);
+        }
+    }
+    try {
+        co_await ss::sleep_abortable(reminder_period, _as.local());
+    } catch (const ss::sleep_aborted&) {
+        // Shutting down - next iteration will drop out
+        co_return;
+    }
+
+    maybe_log_license_nag();
+    maybe_log_security_nag();
+}
+
+void feature_manager::maybe_log_license_nag() {
+    auto enterprise_features = report_enterprise_features();
+    if (enterprise_features.any()) {
+        if (_feature_table.local().should_sanction()) {
+            vlog(
+              clusterlog.warn,
+              "{}",
+              features::enterprise_error_message::license_nag(
+                enterprise_features.enabled()));
+        }
+    }
+}
+
+void feature_manager::maybe_log_security_nag() {
+    if (config::has_sasl_mechanism(config::plain)) {
+        const bool any_tls_disabled
+          = std::ranges::any_of(
+              config::node_config().kafka_api_tls.value(),
+              [](const config::endpoint_tls_config& cfg) {
+                  return !cfg.config.is_enabled();
+              })
+            || config::node_config().kafka_api_tls.value().empty();
+
+        vlogl(
+          clusterlog,
+          any_tls_disabled ? ss::log_level::error : ss::log_level::warn,
+          "SASL/PLAIN is enabled. This is insecure and not recommended for "
+          "production.");
+    }
+}
+
+bool feature_manager::need_to_verify_enterprise_license() {
+    return features::is_major_version_upgrade(
+      _feature_table.local().get_active_version(),
+      _feature_table.local().get_latest_logical_version());
+}
+
+void feature_manager::verify_enterprise_license() {
+    vlog(clusterlog.debug, "Verifying enterprise license...");
+
+    if (!need_to_verify_enterprise_license()) {
+        vlog(clusterlog.debug, "Enterprise license verification skipped...");
+        _verified_enterprise_license.signal();
+        return;
+    }
+
+    std::optional<security::license> fallback_license = std::nullopt;
+    auto fallback_license_str = std::getenv(
+      "REDPANDA_FALLBACK_ENTERPRISE_LICENSE");
+    if (fallback_license_str != nullptr) {
+        try {
+            fallback_license.emplace(
+              security::make_license(fallback_license_str));
+        } catch (const security::license_exception& e) {
+            // Log the error and continue without a fallback license
+            vlog(
+              clusterlog.warn,
+              "Failed to parse fallback license: {}",
+              e.what());
+        }
+    }
+
+    auto invalid = [](const std::optional<security::license>& license) {
+        return !license || license->is_expired();
+    };
+    auto license_missing_or_expired = _feature_table.local().should_sanction()
+                                      && invalid(fallback_license);
+    auto enterprise_features = report_enterprise_features();
+
+    vlog(
+      clusterlog.info,
+      "Verifying enterprise license: active_version={}, latest_version={}, "
+      "enterprise_features=[{}], license_missing_or_expired={}{}",
+      _feature_table.local().get_active_version(),
+      _feature_table.local().get_latest_logical_version(),
+      fmt::join(enterprise_features.enabled(), ", "),
+      license_missing_or_expired,
+      fallback_license ? " (detected fallback license)" : "");
+
+    if (enterprise_features.any() && license_missing_or_expired) {
+        throw std::runtime_error{
+          features::enterprise_error_message::upgrade_failure(
+            enterprise_features.enabled())};
+    }
+
+    _verified_enterprise_license.signal();
+}
+
+ss::future<> feature_manager::maybe_update_feature_table() {
+    // Before doing any feature enablement or active version update, check that
+    // the cluster has an enterprise license if they use enterprise features
+    if (need_to_verify_enterprise_license()) {
+        vlog(
+          clusterlog.debug,
+          "Waiting for enterprise license to be verified before checking for "
+          "active version updates...");
+        // Immediately release the semaphore units because we are only using it
+        // to wait for the precondition to be met
+        std::ignore = co_await ss::get_units(
+          _verified_enterprise_license, 1, _as.local());
+    }
+
+    vlog(clusterlog.debug, "Checking for active version update...");
+    bool failed = false;
+    bool failed_barrier = false;
+    try {
+        co_await do_maybe_update_active_version(failed_barrier);
+    } catch (...) {
+        // This is fine: exceptions can result from unavailability of
+        // raft0 for writes, or unavailability of health monitor
+        // data for one of the nodes.
+        vlog(
+          clusterlog.debug,
+          "Exception updating cluster version, will retry ({})",
+          std::current_exception());
+        failed = true;
+    }
+
+    try {
+        // Even if we didn't advance our logical version, we might have some
+        // features to activate due to policy changes across different redpanda
+        // binaries with the same logical version.
+        //
+        // since do_maybe_activate_features also controls feature activation
+        // based on configuration options, we skip it if the step above failed
+        // to enforce a lineariable barrier.
+        if (!failed_barrier) {
+            co_await do_maybe_activate_features();
+        }
+    } catch (...) {
+        vlog(
+          clusterlog.debug,
+          "Exception activating features, will retry ({})",
+          std::current_exception());
+        failed = true;
+    }
+
+    try {
+        if (failed) {
+            // Sleep for a while before next iteration of our outer do_until
+            co_await ss::sleep_abortable(status_retry, _as.local());
+        } else {
+            // Sleep until we have some node version updates to process, or
+            // some feature activations to do.
+            co_await _update_wait.wait([this]() { return updates_pending(); });
+        }
+    } catch (const ss::condition_variable_timed_out&) {
+        // Wait complete - proceed around next loop of do_until
+    } catch (const ss::broken_condition_variable&) {
+        // Shutting down - nextiteration will drop out
+    } catch (const ss::sleep_aborted&) {
+        // Shutting down - next iteration will drop out
+    }
+}
+
+std::vector<std::reference_wrapper<const features::feature_spec>>
+feature_manager::auto_activate_features(
+  cluster_version original_version, cluster_version effective_version) {
+    std::vector<std::reference_wrapper<const features::feature_spec>> result;
+
+    if (config::shard_local_cfg().features_auto_enable()) {
+        /*
+         * We auto-enable features if:
+         * - The global features_auto_enable setting is true.
+         * - They are not disabled
+         * - One of:
+         *   * Their policy is set to `always` and required_version is satisfied
+         *     by cluster's current version
+         *   * Their policy is set to `new_clusters_only` and required_version
+         *     is satisfied by cluster's original version.
+         */
+        for (const auto& fs : _feature_table.local().get_feature_state()) {
+            if ((fs.get_state() == features::feature_state::state::unavailable ||
+           fs.get_state() == features::feature_state::state::available) &&
+          ((fs.spec.available_rule ==
+                features::feature_spec::available_policy::always &&
+            effective_version >= fs.spec.require_version) ||
+           (fs.spec.available_rule ==
+                features::feature_spec::available_policy::new_clusters_only &&
+            original_version >= fs.spec.require_version))) {
+                result.push_back(fs.spec);
+            }
+        }
+    }
+
+    return result;
+}
+
+ss::future<> feature_manager::replicate_feature_update_cmd(
+  feature_update_cmd_data data, std::optional<model::term_id> term) {
+    auto new_version = data.logical_version;
+    auto cmd = feature_update_cmd(
+      std::move(data),
+      0 // unused
+    );
+
+    auto timeout = model::timeout_clock::now() + status_retry;
+    auto err = co_await replicate_and_wait(
+      _stm, _as, std::move(cmd), timeout, term);
+    if (err == errc::not_leader) {
+        // Harmless, we lost leadership so the new controller
+        // leader is responsible for picking up where we left off.
+        co_return;
+    } else if (err) {
+        // Raise exception to trigger backoff+retry
+        throw std::runtime_error(
+          fmt::format(
+            "Error storing cluster version {}: {}", new_version, err));
+    }
+}
+
+void feature_manager::update_node_version(
+  model::node_id update_node, cluster_version v) {
+    vassert(ss::this_shard_id() == backend_shard, "Wrong shard!");
+
+    vlog(
+      clusterlog.debug,
+      "update_node_version: enqueuing update node={} version={}",
+      update_node,
+      v);
+
+    _updates.insert_or_assign(update_node, v);
+    _update_wait.signal();
+}
+
+/**
+ * Reconcile node versions & health with the feature state, and make
+ * updates as needed.
+ *
+ * This function is allowed to throw: throwing an exception indicates
+ * a transient error that the caller should retry after a backoff.
+ */
+ss::future<>
+feature_manager::do_maybe_update_active_version(bool& failed_barrier) {
+    vassert(ss::this_shard_id() == backend_shard, "Wrong shard!");
+
+    // One-shot consume of the manual-finalization request: every
+    // invocation clears the flag and decides what to do based on the
+    // captured value. Any early return or throw below leaves the flag
+    // cleared, so the next loop tick will defer (until the operator
+    // re-issues) when auto-finalization is disabled.
+    const bool was_manual_finalize_pending = std::exchange(
+      _manual_finalize_pending, false);
+
+    // Clear the membership-change wake bit before evaluating, so any
+    // change that races our read of members_table re-sets it and
+    // triggers another pass.
+    _members_changed = false;
+
+    if (!_is_leader_of.has_value()) {
+        // Drop accumulated updates to bound memory while we're not
+        // the leader; updates_pending() already short-circuits when
+        // not leader, so this isn't load-bearing for the loop's
+        // sleep on _update_wait.
+        _updates.clear();
+        co_return;
+    }
+
+    // The controller replays committed entries through the muxed
+    // config_manager concurrently with this loop, so without a barrier
+    // we can observe intermediate cluster-config states mid-replay —
+    // for example a transient value of features_auto_finalization
+    // before the operator's override has been applied. Wait once per
+    // term for the STM to apply through a linearizable barrier offset;
+    // while leadership is held, subsequent committed entries replicate
+    // through us, so per-tick barriers aren't needed. On transient
+    // barrier failure we throw rather than return so the outer loop
+    // sleeps status_retry before retrying (avoiding a tight spin when
+    // the barrier fails synchronously), and so that _updates is
+    // preserved for the next attempt.
+    // Need a fresh barrier when we have no record of one, or when the
+    // recorded barrier was for a different term than the one we now
+    // hold leadership for.
+    const bool need_barrier = !_caught_up_for_term.has_value()
+                              || *_caught_up_for_term != *_is_leader_of;
+    const auto target_term = *_is_leader_of;
+    if (need_barrier) {
+        auto deadline = model::timeout_clock::now() + status_retry;
+        auto barrier = co_await _stm.local().insert_linearizable_barrier(
+          deadline);
+        if (!barrier) {
+            failed_barrier = true;
+            throw std::runtime_error(
+              fmt::format("Linearizable barrier failed: {}", barrier.error()));
+        }
+        // Leadership may have changed during the co_await above:
+        // either we lost it (no longer leader) or it bounced to a
+        // newer term.
+        const bool leadership_changed = !_is_leader_of.has_value()
+                                        || *_is_leader_of != target_term;
+        if (leadership_changed) {
+            // Leadership changed mid-barrier. Don't throw — this isn't
+            // a transient error to retry against, it's a state change.
+            // The next loop iteration handles it cleanly: if we're no
+            // longer leader, the !_is_leader_of branch above drains
+            // _updates and returns; if we're leader in a fresh term,
+            // the leadership notification handler already reset
+            // _caught_up_for_term, so we re-run the barrier for the
+            // new term before draining and applying updates. We
+            // deliberately do not set _caught_up_for_term here: the
+            // offset we observed was acknowledged under the old term
+            // and is not safe to treat as caught-up for the new one.
+            vlog(
+              clusterlog.debug,
+              "Deferring active version update: leadership changed "
+              "during barrier (was term {}, now {})",
+              target_term,
+              _is_leader_of);
+            failed_barrier = true;
+            co_return;
+        }
+        _caught_up_for_term = target_term;
+        vlog(
+          clusterlog.debug,
+          "Controller STM caught up to barrier offset {} in term {}",
+          barrier.value().first,
+          target_term);
+    }
+
+    // Consume accumulated updates now that the barrier has confirmed
+    // we are caught up. Deferring the drain until here means a
+    // transient barrier failure doesn't discard pending updates.
+    auto updates = std::exchange(_updates, {});
+
+    // Apply updates into _node_versions
+    for (const auto& i : updates) {
+        auto& [node, v] = i;
+        vlog(clusterlog.debug, "Processing update node={} version={}", node, v);
+        _node_versions[node] = v;
+    }
+
+    // Check if _node_versions indicates a possible active version update
+    const auto active_version = _feature_table.local().get_active_version();
+    cluster_version max_version = invalid_version;
+    for (const auto& i : _node_versions) {
+        max_version = std::max(i.second, max_version);
+    }
+    if (max_version <= active_version) {
+        vlog(
+          clusterlog.debug,
+          "No update, max version {} not ahead of {}",
+          max_version,
+          active_version);
+        co_return;
+    }
+
+    // When auto-finalization is disabled and no manual request was
+    // captured this tick, defer the advance until the operator
+    // explicitly requests it via the admin API.
+    if (
+      !config::shard_local_cfg().features_auto_finalization()
+      && !was_manual_finalize_pending) {
+        vlog(
+          clusterlog.debug,
+          "Deferring cluster active version advance to {}: "
+          "features_auto_finalization is disabled and no manual request "
+          "is pending",
+          max_version);
+        co_return;
+    }
+
+    // Conditions for updating active version:
+    // A) Version must be known for all member nodes
+    // B) All member nodes must be up
+    // C) All versions must be >= the new active version
+
+    // Ensure that our _node_versions contains versions for all
+    // nodes in members_table & that they are all sufficiently recent
+    const auto& member_table = _members.local();
+    for (const auto& node_id : member_table.node_ids()) {
+        auto v_iter = _node_versions.find(node_id);
+        if (v_iter == _node_versions.end()) {
+            vlog(
+              clusterlog.debug,
+              "Can't update active version to {} because node {} "
+              "version unknown",
+              max_version,
+              node_id);
+            co_return;
+        } else if (v_iter->second < max_version) {
+            vlog(
+              clusterlog.debug,
+              "Can't update active version to {} because "
+              "node {} "
+              "version is too low ({})",
+              max_version,
+              node_id,
+              v_iter->second);
+            co_return;
+        }
+
+        auto is_alive_opt = _hm_frontend.local().is_alive(node_id);
+        if (!is_alive_opt.has_value()) {
+            // Unexpected: the health monitor should be populating
+            // state for all known members_table nodes, but this
+            // could happen if we raced with a decom or node add.
+            // Raise exception to trigger backoff+retry
+            throw std::runtime_error(fmt_with_ctx(
+              fmt::format,
+              "Can't update active version to {} because node {} "
+              "has no health state",
+              max_version,
+              node_id));
+
+        } else if (is_alive_opt == alive::no) {
+            // Raise exception to trigger backoff+retry
+            throw std::runtime_error(fmt_with_ctx(
+              fmt::format,
+              "Can't update active version to {} because node {} "
+              "is not alive",
+              max_version,
+              node_id));
+        }
+    }
+
+    // All node checks passed, we are ready to increment active version
+    auto data = feature_update_cmd_data{.logical_version = max_version};
+
+    // Identify any features which should auto-activate in this version
+    for (const auto spec : auto_activate_features(
+           _feature_table.local().get_original_version(), max_version)) {
+        vlog(
+          clusterlog.info,
+          "Auto-activating feature {} (logical version {})",
+          spec.get().name,
+          max_version);
+        data.actions.push_back(
+          cluster::feature_update_action{
+            .feature_name = ss::sstring(spec.get().name),
+            .action = feature_update_action::action_t::activate});
+    }
+
+    co_await replicate_feature_update_cmd(std::move(data), target_term);
+
+    vlog(clusterlog.info, "Updated cluster (logical version {})", max_version);
+}
+
+ss::future<feature_manager::finalize_status>
+feature_manager::submit_manual_finalize_request() {
+    vassert(ss::this_shard_id() == backend_shard, "Wrong shard!");
+
+    if (!_is_leader_of.has_value()) {
+        co_return finalize_status::not_leader;
+    }
+
+    // Arm the flag and wake the loop. The loop body validates cluster
+    // preconditions on its next tick; if they fail, the existing throw
+    // path triggers retry, but the flag is cleared at the start of the
+    // attempt so the retry will defer until the operator re-issues.
+    _manual_finalize_pending = true;
+    _update_wait.signal();
+    co_return finalize_status::ok;
+}
+
+ss::future<feature_manager::upgrade_status>
+feature_manager::get_upgrade_status() {
+    vassert(ss::this_shard_id() == backend_shard, "Wrong shard!");
+
+    upgrade_status status;
+    status.active_version = _feature_table.local().get_active_version();
+    status.auto_finalization_enabled
+      = config::shard_local_cfg().features_auto_finalization();
+
+    // The version a finalize would aim for: the highest logical version
+    // reported by any node. Matches do_maybe_update_active_version.
+    cluster_version max_version = invalid_version;
+    for (const auto& i : _node_versions) {
+        max_version = std::max(i.second, max_version);
+    }
+
+    // Best-effort enrichment: map node -> human-readable release version
+    // from the cached cluster health report. Exclude per-partition health
+    // (include_partitions::no): we only need each node's reported
+    // redpanda_version, and pulling partition metadata would make this
+    // pollable read-only RPC needlessly expensive on large clusters. A
+    // fetch failure just leaves release_version empty; the version
+    // observability below does not depend on it.
+    std::map<model::node_id, ss::sstring> release_by_node;
+    auto health = co_await _hm_frontend.local().get_cluster_health(
+      cluster_report_filter{
+        .node_report_filter
+        = node_report_filter{.include_partitions = include_partitions_info::no}},
+      force_refresh::no,
+      model::timeout_clock::now() + health_monitor_frontend::default_timeout);
+    if (health) {
+        for (const auto& report : health.value().node_reports) {
+            release_by_node.emplace(
+              report->id, report->local_state.redpanda_version());
+        }
+    }
+
+    // Gather per-member version + liveness, mirroring the precondition
+    // checks in do_maybe_update_active_version (all members known, all
+    // versions >= max_version, all alive). Kept as a read-only mirror
+    // rather than sharing code with that safety-critical loop; the raw
+    // per-member fields below are authoritative even if the rolled-up
+    // state lags a change to the loop's predicate.
+    bool all_known = true;
+    bool all_sufficient = true;
+    bool all_alive = true;
+    for (const auto& node_id : _members.local().node_ids()) {
+        upgrade_status::member m;
+        m.id = node_id;
+        if (
+          auto it = _node_versions.find(node_id); it != _node_versions.end()) {
+            m.version_known = true;
+            m.logical_version = it->second;
+            all_sufficient &= it->second >= max_version;
+        } else {
+            all_known = false;
+        }
+        m.alive = _hm_frontend.local().is_alive(node_id) == alive::yes;
+        all_alive &= m.alive;
+        if (
+          auto it = release_by_node.find(node_id);
+          it != release_by_node.end()) {
+            m.release_version = it->second;
+        }
+        status.members.push_back(std::move(m));
+    }
+
+    using state = upgrade_status::finalization_state;
+    if (max_version <= status.active_version) {
+        status.state = state::finalized;
+        status.version_after_finalization = status.active_version;
+    } else if (all_known && all_sufficient && all_alive) {
+        status.state = state::ready_to_finalize;
+        status.version_after_finalization = max_version;
+    } else {
+        status.state = state::upgrade_in_progress;
+        status.version_after_finalization = status.active_version;
+    }
+
+    co_return status;
+}
+
+ss::future<> feature_manager::do_maybe_activate_features() {
+    if (!_is_leader_of.has_value()) {
+        co_return;
+    }
+
+    auto activate_features = auto_activate_features(
+      _feature_table.local().get_original_version(),
+      _feature_table.local().get_active_version());
+    if (!activate_features.empty()) {
+        vlog(clusterlog.info, "Activating features after upgrade...");
+
+        auto data = feature_update_cmd_data{
+          .logical_version = _feature_table.local().get_active_version()};
+        for (const auto spec : activate_features) {
+            vlog(
+              clusterlog.info,
+              "Activating feature {} (logical version {})",
+              spec.get().name,
+              _feature_table.local().get_active_version());
+            data.actions.push_back(
+              cluster::feature_update_action{
+                .feature_name = ss::sstring(spec.get().name),
+                .action = feature_update_action::action_t::activate});
+        }
+
+        co_await replicate_feature_update_cmd(std::move(data));
+    }
+}
+
+ss::future<std::error_code>
+feature_manager::update_license(security::license&& license) {
+    const auto timeout = model::timeout_clock::now() + 5s;
+
+    auto cmd = cluster::feature_update_license_update_cmd(
+      cluster::feature_update_license_update_cmd_data{
+        .redpanda_license = license},
+      0 // unused
+    );
+    auto err = co_await replicate_and_wait(_stm, _as, std::move(cmd), timeout);
+    if (err) {
+        co_return err;
+    }
+    vlog(clusterlog.info, "Loaded new license into cluster: {}", license);
+    co_return make_error_code(errc::success);
+}
+
+ss::future<std::error_code>
+feature_manager::write_action(cluster::feature_update_action action) {
+    auto feature_id_opt = _feature_table.local().resolve_name(
+      action.feature_name);
+
+    // This should  have been validated by admin server before calling us
+    vassert(
+      feature_id_opt.has_value(),
+      "Invalid feature name '{}'",
+      action.feature_name);
+
+    // Validate that the feature is in a state compatible with the
+    // requested transition.
+    bool valid = true;
+    auto state = _feature_table.local().get_state(feature_id_opt.value());
+    switch (action.action) {
+    case cluster::feature_update_action::action_t::complete_preparing:
+        // Look up feature by name
+        if (state.get_state() != features::feature_state::state::preparing) {
+            // Drop this silently, we presume that this is some kind of
+            // race and the thing we thought was preparing is either
+            // now active or administratively deactivated.
+            valid = false;
+        }
+
+        break;
+    case cluster::feature_update_action::action_t::activate:
+        if (
+          state.get_state() != features::feature_state::state::available
+          && state.get_state() != features::feature_state::state::disabled_clean
+          && state.get_state()
+               != features::feature_state::state::disabled_active
+          && state.get_state()
+               != features::feature_state::state::disabled_preparing) {
+            valid = false;
+        }
+        break;
+    case cluster::feature_update_action::action_t::deactivate:
+        if (
+          state.get_state() == features::feature_state::state::disabled_clean
+          || state.get_state()
+               == features::feature_state::state::disabled_preparing
+          || state.get_state()
+               == features::feature_state::state::disabled_active) {
+            valid = false;
+        }
+    }
+
+    if (!valid) {
+        vlog(
+          clusterlog.warn,
+          "Dropping feature action {}, feature not in expected state "
+          "(state={})",
+          action,
+          state.get_state());
+        return ss::make_ready_future<std::error_code>(cluster::errc::success);
+    } else {
+        // Construct and dispatch command to log
+        auto timeout = model::timeout_clock::now() + status_retry;
+        auto data = feature_update_cmd_data{
+          .logical_version = _feature_table.local().get_active_version(),
+          .actions = {action}};
+        auto cmd = feature_update_cmd(
+          std::move(data),
+          0 // unused
+        );
+        return replicate_and_wait(_stm, _as, std::move(cmd), timeout);
+    }
+}
+
+void feature_manager::set_node_to_latest_version(const model::node_id node_id) {
+    const cluster_version latest
+      = features::feature_table::get_latest_logical_version();
+    if (
+      const version_map::iterator i = _node_versions.find(node_id);
+      i != _node_versions.end()) {
+        if (i->second == latest) {
+            return; // already there
+        }
+        vlog(
+          clusterlog.info,
+          "Overriding a previously set version for {} from {} to {}",
+          node_id,
+          i->second,
+          latest);
+    }
+    update_node_version(node_id, latest);
+}
+
+} // namespace cluster

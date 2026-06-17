@@ -1,0 +1,270 @@
+// Copyright 2020 Redpanda Data, Inc.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.md
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0
+
+#include "storage/tests/utils/disk_log_builder.h"
+
+#include "compaction/types.h"
+#include "model/record_batch_types.h"
+#include "storage/disk_log_appender.h"
+#include "storage/types.h"
+
+using namespace std::chrono_literals; // NOLINT
+
+// util functions to be moved from storage_fixture
+// make_ntp, make_dir etc
+namespace storage {
+disk_log_builder::disk_log_builder(
+  storage::log_config config,
+  std::vector<model::record_batch_type> types,
+  raft::group_id group_id)
+  : _log_config(std::move(config))
+  , _translator_batch_types(std::move(types))
+  , _group_id(group_id)
+  , _storage(
+      [this]() {
+          return kvstore_config(
+            1_MiB,
+            config::mock_binding(10ms),
+            _log_config.base_dir,
+            storage::make_sanitized_file_config());
+      },
+      [this]() { return _log_config; },
+      _feature_table) {}
+
+// Batch generation
+ss::future<> disk_log_builder::add_random_batch(
+  model::offset offset,
+  int num_records,
+  maybe_compress_batches comp,
+  model::record_batch_type bt,
+  log_append_config config,
+  should_flush_after flush,
+  std::optional<model::timestamp> base_ts) {
+    auto buff = chunked_circular_buffer<model::record_batch>();
+    buff.push_back(
+      model::test::make_random_batch(
+        offset, num_records, bool(comp), bt, std::nullopt, now(base_ts)));
+    advance_time(buff.back());
+    return write(std::move(buff), config, flush);
+}
+
+ss::future<> disk_log_builder::add_random_batch(
+  model::test::record_batch_spec spec,
+  log_append_config config,
+  should_flush_after flush) {
+    auto buff = chunked_circular_buffer<model::record_batch>();
+    buff.push_back(model::test::make_random_batch(spec));
+    advance_time(buff.back());
+    return write(std::move(buff), config, flush);
+}
+
+ss::future<> disk_log_builder::add_random_batches(
+  model::offset offset,
+  int count,
+  maybe_compress_batches comp,
+  log_append_config config,
+  should_flush_after flush,
+  std::optional<model::timestamp> base_ts) {
+    auto batches = co_await model::test::make_random_batches(
+      offset, count, bool(comp), base_ts);
+    advance_time(batches.back());
+    co_return co_await write(std::move(batches), config, flush);
+}
+
+ss::future<> disk_log_builder::add_random_batches(
+  model::offset offset, log_append_config config, should_flush_after flush) {
+    co_return co_await write(
+      co_await model::test::make_random_batches(offset), config, flush);
+}
+
+ss::future<> disk_log_builder::add_batch(
+  model::record_batch batch,
+  log_append_config config,
+  should_flush_after flush) {
+    auto buf = chunked_circular_buffer<model::record_batch>();
+    advance_time(batch);
+    buf.push_back(std::move(batch));
+    return write(std::move(buf), config, flush);
+}
+// Log managment
+ss::future<> disk_log_builder::start(model::ntp ntp) {
+    return start(ntp_config(std::move(ntp), get_log_config().base_dir));
+}
+
+ss::future<> disk_log_builder::start(storage::ntp_config cfg) {
+    co_await _feature_table.start();
+    co_await _feature_table.invoke_on_all(
+      [](features::feature_table& f) { f.testing_activate_all(); });
+
+    co_await _storage.start();
+    _log = co_await _storage.log_mgr().manage(
+      std::move(cfg), _group_id, _translator_batch_types);
+    _log->stm_hookset()->start();
+}
+
+ss::future<> disk_log_builder::truncate(model::offset o) {
+    return get_log()->truncate(storage::truncate_config(o));
+}
+
+ss::future<> disk_log_builder::gc(
+  model::timestamp collection_upper_bound,
+  std::optional<size_t> max_partition_retention_size,
+  std::optional<std::chrono::milliseconds> tombstone_retention_ms) {
+    ss::abort_source as;
+    auto eviction_future = get_log()->monitor_eviction(as);
+
+    get_log()
+      ->housekeeping(housekeeping_config(
+        collection_upper_bound,
+        max_partition_retention_size,
+        model::offset::max(),
+        model::offset::max(),
+        model::offset::max(),
+        tombstone_retention_ms,
+        std::nullopt,
+        std::chrono::milliseconds{0},
+        _abort_source))
+      .get();
+
+    if (eviction_future.available()) {
+        auto evict_until = eviction_future.get();
+        return get_log()->truncate_prefix(
+          storage::truncate_prefix_config{model::next_offset(evict_until)});
+    } else {
+        as.request_abort();
+        eviction_future.ignore_ready_future();
+    }
+
+    return ss::make_ready_future<>();
+}
+
+ss::future<usage_report> disk_log_builder::disk_usage(
+  model::timestamp collection_upper_bound,
+  std::optional<size_t> max_partition_retention_size) {
+    return get_disk_log_impl().disk_usage(
+      gc_config(collection_upper_bound, max_partition_retention_size));
+}
+
+ss::future<std::optional<model::offset>>
+disk_log_builder::apply_retention(gc_config cfg) {
+    return get_disk_log_impl().do_gc(cfg);
+}
+
+ss::future<> disk_log_builder::apply_adjacent_merge_compaction(
+  compaction::compaction_config cfg,
+  std::optional<model::offset> new_start_offset) {
+    return get_disk_log_impl().adjacent_merge_compact(
+      get_disk_log_impl().segments().copy(), cfg, new_start_offset);
+}
+
+ss::future<bool> disk_log_builder::apply_sliding_window_compaction(
+  compaction::compaction_config cfg,
+  std::optional<model::offset> new_start_offset) {
+    return get_disk_log_impl().sliding_window_compact(cfg, new_start_offset);
+}
+
+ss::future<bool>
+disk_log_builder::update_start_offset(model::offset start_offset) {
+    return get_disk_log_impl().update_start_offset(start_offset);
+}
+void disk_log_builder::add_dirty_segment_bytes(ssize_t bytes) {
+    get_disk_log_impl().add_dirty_segment_bytes(bytes);
+}
+void disk_log_builder::add_closed_segment_bytes(ssize_t bytes) {
+    get_disk_log_impl().add_closed_segment_bytes(bytes);
+}
+
+ss::future<> disk_log_builder::stop() {
+    _log->stm_hookset()->stop();
+    return _storage.stop().then([this]() { return _feature_table.stop(); });
+}
+
+// Low lever interface access
+// Access log impl
+ss::shared_ptr<log> disk_log_builder::get_log() {
+    vassert(_log, "Log is unintialized. Please use start() first");
+    return _log;
+}
+
+disk_log_impl& disk_log_builder::get_disk_log_impl() {
+    return dynamic_cast<disk_log_impl&>(*_log);
+}
+
+segment_set& disk_log_builder::get_log_segments() {
+    auto& segment_set = get_disk_log_impl().segments();
+    vassert(!segment_set.empty(), "There are no segments in the segment_set");
+    return segment_set;
+}
+
+segment& disk_log_builder::get_segment(size_t index) {
+    auto& segment_set = get_log_segments();
+    vassert(
+      index < segment_set.size(), "There are no segments in the segment_set");
+    return *std::next(segment_set.begin(), index)->get();
+}
+
+segment_index& disk_log_builder::get_seg_index_ptr(size_t index) {
+    return get_segment(index).index();
+}
+
+// Create segments
+ss::future<>
+disk_log_builder::add_segment(model::offset offset, model::term_id term) {
+    return get_disk_log_impl().new_segment(offset, term);
+}
+
+// Configuration getters
+const log_config& disk_log_builder::get_log_config() const {
+    return _log_config;
+}
+
+// Common interface for appending batches
+ss::future<> disk_log_builder::write(
+  chunked_circular_buffer<model::record_batch> buff,
+  const log_append_config& config,
+  should_flush_after flush) {
+    if (buff.empty()) {
+        return ss::now();
+    }
+    auto base_offset = buff.front().base_offset();
+    auto reader = model::make_memory_record_batch_reader(std::move(buff));
+    // we do not use the log::make_appender method to be able to controll the
+    // appender base offset and insert holes into the log
+    disk_log_appender appender(
+      get_disk_log_impl(), config, log_clock::now(), base_offset);
+    return std::move(reader)
+      .for_each_ref(std::move(appender), config.timeout)
+      .then([this, flush](storage::append_result ar) {
+          _bytes_written += ar.byte_size;
+          if (flush) {
+              return _log->flush();
+          }
+          return ss::now();
+      });
+}
+
+void populate_log(storage::disk_log_builder& b, const log_spec& spec) {
+    auto first = spec.segment_starts.begin();
+    auto second = std::next(first);
+    for (; second != spec.segment_starts.end(); ++first, ++second) {
+        auto num_records = *second - *first;
+        b | storage::add_segment(*first)
+          | storage::add_random_batch(*first, num_records);
+    }
+    b | storage::add_segment(*first)
+      | storage::add_random_batch(*first, spec.last_segment_num_records);
+
+    for (auto i : spec.compacted_segment_indices) {
+        b.get_segment(i).index().maybe_set_self_compact_timestamp(
+          model::timestamp::now());
+        b.get_segment(i).mark_as_finished_windowed_compaction();
+    }
+}
+
+} // namespace storage

@@ -1,0 +1,374 @@
+// Copyright 2024 Redpanda Data, Inc.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.md
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0
+
+#include "cluster/topic_properties.h"
+
+#include "base/format_to.h"
+#include "model/adl_serde.h"
+#include "model/metadata.h"
+#include "reflection/adl.h"
+
+namespace cluster {
+fmt::iterator topic_properties::format_to(fmt::iterator it) const {
+    return fmt::format_to(
+      it,
+      "{{ compression: {}, cleanup_policy_bitflags: {}, compaction_strategy: "
+      "{}, retention_bytes: {}, retention_duration_ms: {}, segment_size: {}, "
+      "timestamp_type: {}, recovery_enabled: {}, shadow_indexing: {}, "
+      "read_replica: {}, read_replica_bucket: {}, "
+      "remote_topic_namespace_override: {}, "
+      "remote_topic_properties: {}, "
+      "remote_topic_allow_gaps: {}, "
+      "batch_max_bytes: {}, retention_local_target_bytes: {}, "
+      "retention_local_target_ms: {}, remote_delete: {}, segment_ms: {}, "
+      "schema_registry_context: {}, "
+      "record_key_schema_id_validation: {}, "
+      "record_key_schema_id_validation_compat: {}, "
+      "record_key_subject_name_strategy: {}, "
+      "record_key_subject_name_strategy_compat: {}, "
+      "record_value_schema_id_validation: {}, "
+      "record_value_schema_id_validation_compat: {}, "
+      "record_value_subject_name_strategy: {}, "
+      "record_value_subject_name_strategy_compat: {}, "
+      "initial_retention_local_target_bytes: {}, "
+      "initial_retention_local_target_ms: {}, "
+      "mpx_virtual_cluster_id: {}, "
+      "write_caching: {}, "
+      "flush_ms: {}, "
+      "flush_bytes: {}, "
+      "remote_label: {}, iceberg_mode: {}, "
+      "leaders_preference: {}, "
+      "delete_retention_ms: {}, "
+      "iceberg_delete: {}, "
+      "iceberg_partition_spec: {}, "
+      "iceberg_invalid_record_action: {}, "
+      "iceberg_target_lag_ms: {}, "
+      "min_cleanable_dirty_ratio: {}, "
+      "min_compaction_lag_ms: {}, "
+      "max_compaction_lag_ms: {}, "
+      "message_timestamp_before_max_ms: {}, "
+      "message_timestamp_after_max_ms: {}, "
+      "redpanda_storage_mode: {}}}",
+      compression,
+      cleanup_policy_bitflags,
+      compaction_strategy,
+      retention_bytes,
+      retention_duration,
+      segment_size,
+      timestamp_type,
+      recovery,
+      shadow_indexing,
+      read_replica,
+      read_replica_bucket,
+      remote_topic_namespace_override,
+      remote_topic_properties,
+      remote_topic_allow_gaps,
+      batch_max_bytes,
+      retention_local_target_bytes,
+      retention_local_target_ms,
+      remote_delete,
+      segment_ms,
+      schema_registry_context,
+      record_key_schema_id_validation,
+      record_key_schema_id_validation_compat,
+      record_key_subject_name_strategy,
+      record_key_subject_name_strategy_compat,
+      record_value_schema_id_validation,
+      record_value_schema_id_validation_compat,
+      record_value_subject_name_strategy,
+      record_value_subject_name_strategy_compat,
+      initial_retention_local_target_bytes,
+      initial_retention_local_target_ms,
+      mpx_virtual_cluster_id,
+      write_caching,
+      flush_ms,
+      flush_bytes,
+      remote_label,
+      iceberg_mode,
+      leaders_preference,
+      delete_retention_ms,
+      iceberg_delete,
+      iceberg_partition_spec,
+      iceberg_invalid_record_action,
+      iceberg_target_lag_ms,
+      min_cleanable_dirty_ratio,
+      min_compaction_lag_ms,
+      max_compaction_lag_ms,
+      message_timestamp_before_max_ms,
+      message_timestamp_after_max_ms,
+      storage_mode);
+}
+
+bool topic_properties::is_local_topic() const {
+    switch (storage_mode) {
+    case model::redpanda_storage_mode::local:
+        return true;
+    case model::redpanda_storage_mode::tiered:
+        return false;
+    case model::redpanda_storage_mode::cloud:
+        return false;
+    case model::redpanda_storage_mode::tiered_cloud:
+        return false;
+    case model::redpanda_storage_mode::unset:
+        // Unset storage mode, infer from archival and remote fetch settings.
+        return !is_archival_enabled() && !is_remote_fetch_enabled();
+    }
+    vunreachable(
+      "unknown redpanda_storage_mode: {}", std::to_underlying(storage_mode));
+}
+
+bool topic_properties::is_compacted() const {
+    if (!cleanup_policy_bitflags) {
+        return false;
+    }
+    return (cleanup_policy_bitflags.value()
+            & model::cleanup_policy_bitflags::compaction)
+           == model::cleanup_policy_bitflags::compaction;
+}
+
+bool topic_properties::has_overrides() const {
+    const auto overrides
+      = cleanup_policy_bitflags || compaction_strategy || segment_size
+        || retention_bytes.is_engaged() || retention_duration.is_engaged()
+        || recovery.has_value() || shadow_indexing.has_value()
+        || read_replica.has_value()
+        || remote_topic_namespace_override.has_value()
+        || batch_max_bytes.has_value()
+        || retention_local_target_bytes.is_engaged()
+        || retention_local_target_ms.is_engaged()
+        || remote_delete != storage::ntp_config::default_remote_delete
+        || segment_ms.is_engaged()
+        || record_key_schema_id_validation.has_value()
+        || record_key_schema_id_validation_compat.has_value()
+        || record_key_subject_name_strategy.has_value()
+        || record_key_subject_name_strategy_compat.has_value()
+        || record_value_schema_id_validation.has_value()
+        || record_value_schema_id_validation_compat.has_value()
+        || record_value_subject_name_strategy.has_value()
+        || record_value_subject_name_strategy_compat.has_value()
+        || initial_retention_local_target_bytes.is_engaged()
+        || initial_retention_local_target_ms.is_engaged()
+        || write_caching.has_value() || flush_ms.has_value()
+        || flush_bytes.has_value() || remote_label.has_value()
+        || (iceberg_mode != storage::ntp_config::default_iceberg_mode)
+        || leaders_preference.has_value() || delete_retention_ms.is_engaged()
+        || iceberg_delete.has_value() || iceberg_partition_spec.has_value()
+        || iceberg_invalid_record_action.has_value()
+        || iceberg_target_lag_ms.has_value()
+        || min_cleanable_dirty_ratio.is_engaged()
+        || min_compaction_lag_ms.has_value()
+        || max_compaction_lag_ms.has_value()
+        || remote_topic_allow_gaps.has_value()
+        || message_timestamp_before_max_ms.has_value()
+        || message_timestamp_after_max_ms.has_value()
+        || storage_mode != storage::ntp_config::default_storage_mode
+        || schema_registry_context.has_value();
+
+    return overrides;
+}
+
+bool topic_properties::requires_tiered_remote_erase() const {
+    // A tiered topic requires remote erase if it matches all of:
+    // * Using tiered storage (explicit or inferred via shadow_indexing)
+    // * Not a read replica
+    // * Has redpanda.remote.delete=true
+    if (read_replica.value_or(false) || !remote_delete) {
+        return false;
+    }
+    // Explicit tiered = requires remote erase
+    if (storage_mode == model::redpanda_storage_mode::tiered) {
+        return true;
+    }
+    // Explicit local or cloud = no remote erase for tiered
+    if (storage_mode != model::redpanda_storage_mode::unset) {
+        return false;
+    }
+    // Unset = check if shadow_indexing indicates tiered storage
+    auto mode = shadow_indexing.value_or(model::shadow_indexing_mode::disabled);
+    return mode != model::shadow_indexing_mode::disabled;
+}
+
+bool topic_properties::requires_cloud_topic_remote_erase() const {
+    // A cloud topic requires remote erase if it matches all of:
+    // * Using cloud topics
+    // * Not a read replica
+    // * Has redpanda.remote.delete=true
+    return is_cloud_topic() && !read_replica.value_or(false) && remote_delete;
+}
+
+bool topic_properties::requires_iceberg_remote_erase() const {
+    // An iceberg-enabled topic requires remote erase if it matches all of:
+    // * Using iceberg
+    // * Has redpanda.iceberg.delete=true
+    return iceberg_mode != model::iceberg_mode::disabled
+           && iceberg_delete.value_or(
+             config::shard_local_cfg().iceberg_delete());
+}
+
+bool topic_properties::is_archival_enabled() const {
+    // Explicit tiered
+    if (storage_mode == model::redpanda_storage_mode::tiered) {
+        return true;
+    }
+    // Explicit local or cloud
+    if (storage_mode != model::redpanda_storage_mode::unset) {
+        return false;
+    }
+    // Unset = fall back to legacy shadow_indexing
+    return shadow_indexing.has_value()
+           && model::is_archival_enabled(shadow_indexing.value());
+}
+
+bool topic_properties::is_remote_fetch_enabled() const {
+    // Explicit tiered
+    if (storage_mode == model::redpanda_storage_mode::tiered) {
+        return true;
+    }
+    // Explicit local or cloud
+    if (storage_mode != model::redpanda_storage_mode::unset) {
+        return false;
+    }
+    // Unset = fall back to legacy shadow_indexing
+    return shadow_indexing.has_value()
+           && model::is_fetch_enabled(shadow_indexing.value());
+}
+
+storage::ntp_config::default_overrides
+topic_properties::get_ntp_cfg_overrides() const {
+    storage::ntp_config::default_overrides ret;
+    ret.cleanup_policy_bitflags = cleanup_policy_bitflags;
+    ret.compaction_strategy = compaction_strategy;
+    ret.retention_bytes = retention_bytes;
+    ret.retention_time = retention_duration;
+    ret.segment_size = segment_size;
+    ret.shadow_indexing_mode = shadow_indexing;
+    ret.read_replica = read_replica;
+    ret.retention_local_target_bytes = retention_local_target_bytes;
+    ret.retention_local_target_ms = retention_local_target_ms;
+    ret.remote_delete = remote_delete;
+    ret.segment_ms = segment_ms;
+    ret.initial_retention_local_target_bytes
+      = initial_retention_local_target_bytes;
+    ret.initial_retention_local_target_ms = initial_retention_local_target_ms;
+    ret.write_caching = write_caching;
+    ret.flush_ms = flush_ms;
+    ret.flush_bytes = flush_bytes;
+    ret.iceberg_mode = iceberg_mode;
+    ret.delete_retention_ms = delete_retention_ms;
+    ret.min_cleanable_dirty_ratio = min_cleanable_dirty_ratio;
+    ret.min_compaction_lag_ms = min_compaction_lag_ms;
+    ret.max_compaction_lag_ms = max_compaction_lag_ms;
+    ret.remote_allow_gaps = remote_topic_allow_gaps;
+    ret.storage_mode = storage_mode;
+    return ret;
+}
+
+} // namespace cluster
+
+namespace reflection {
+
+// adl is no longer used for serializing new topic properties
+void adl<cluster::topic_properties>::to(
+  iobuf& out, cluster::topic_properties&& p) {
+    reflection::serialize(
+      out,
+      p.compression,
+      p.cleanup_policy_bitflags,
+      p.compaction_strategy,
+      p.timestamp_type,
+      p.segment_size,
+      p.retention_bytes,
+      p.retention_duration,
+      p.recovery,
+      p.shadow_indexing,
+      p.read_replica,
+      p.read_replica_bucket,
+      p.remote_topic_properties);
+}
+
+cluster::topic_properties
+adl<cluster::topic_properties>::from(iobuf_parser& parser) {
+    auto compression
+      = reflection::adl<std::optional<model::compression>>{}.from(parser);
+    auto cleanup_policy_bitflags
+      = reflection::adl<std::optional<model::cleanup_policy_bitflags>>{}.from(
+        parser);
+    auto compaction_strategy
+      = reflection::adl<std::optional<model::compaction_strategy>>{}.from(
+        parser);
+    auto timestamp_type
+      = reflection::adl<std::optional<model::timestamp_type>>{}.from(parser);
+    auto segment_size = reflection::adl<std::optional<size_t>>{}.from(parser);
+    auto retention_bytes = reflection::adl<tristate<size_t>>{}.from(parser);
+    auto retention_duration
+      = reflection::adl<tristate<std::chrono::milliseconds>>{}.from(parser);
+    auto recovery = reflection::adl<std::optional<bool>>{}.from(parser);
+    auto shadow_indexing
+      = reflection::adl<std::optional<model::shadow_indexing_mode>>{}.from(
+        parser);
+    auto read_replica = reflection::adl<std::optional<bool>>{}.from(parser);
+    auto read_replica_bucket
+      = reflection::adl<std::optional<ss::sstring>>{}.from(parser);
+    auto remote_topic_properties
+      = reflection::adl<std::optional<cluster::remote_topic_properties>>{}.from(
+        parser);
+
+    return {
+      compression,
+      cleanup_policy_bitflags,
+      compaction_strategy,
+      timestamp_type,
+      segment_size,
+      retention_bytes,
+      retention_duration,
+      recovery,
+      shadow_indexing,
+      read_replica,
+      read_replica_bucket,
+      std::nullopt,
+      remote_topic_properties,
+      std::nullopt,
+      tristate<size_t>{std::nullopt},
+      tristate<std::chrono::milliseconds>{std::nullopt},
+      // Backward compat: ADL-generation (pre-22.3) topics use legacy tiered
+      // storage mode in which topic deletion does not delete objects in S3
+      false,
+      tristate<std::chrono::milliseconds>{std::nullopt},
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      tristate<size_t>{std::nullopt},
+      tristate<std::chrono::milliseconds>{std::nullopt},
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      model::iceberg_mode::disabled,
+      std::nullopt,
+      tristate<std::chrono::milliseconds>{disable_tristate},
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      tristate<double>{std::nullopt},
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      model::redpanda_storage_mode::local,
+    };
+}
+
+} // namespace reflection

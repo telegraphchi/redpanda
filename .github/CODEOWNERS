@@ -1,0 +1,59 @@
+#
+# docs, prose, legal
+#
+licenses           @emaxerrno
+
+#
+# build
+#
+/.clang-format             @redpanda-data/devprod
+/.clang-tidy               @redpanda-data/devprod
+/.clang_complete           @redpanda-data/devprod
+/.github                   @redpanda-data/devprod
+/.gitignore                @redpanda-data/devprod
+/.gitorderfile             @redpanda-data/devprod
+/.ruff.toml                @redpanda-data/devprod
+
+#
+# crypto
+#
+/src/v/crypto              @redpanda-data/core-enterprise
+
+#
+# rpk
+#
+/src/go/rpk        @r-vasquez @redpanda-data/ux-rpk @kbatuigas
+# There are now two copies goreleaser.yaml in the interim `rpk connect` arch
+# Adding devprod to code owners to review any changes (e.g. they should stay in sync)
+/src/go/.goreleaser.yaml @r-vasquez @redpanda-data/ux-rpk @redpanda-data/devprod
+/src/go/.goreleaser_rpk_connect.yaml @r-vasquez @redpanda-data/ux-rpk @redpanda-data/devprod
+
+#
+# testing
+#
+/tests/docker                       @redpanda-data/devprod
+/tests/run.sh                       @redpanda-data/devprod
+/src/consistency-testing            @mmaslankaprv
+/tests/java/tx-verifier             @mmaslankaprv
+
+#
+# automatically tag docs team for configuration changes
+#
+/src/v/config/configuration.cc                      @redpanda-data/documentation
+/src/v/config/configuration.h                       @redpanda-data/documentation
+/src/v/config/node_config.cc                        @redpanda-data/documentation
+/src/v/config/node_config.h                         @redpanda-data/documentation
+/src/v/kafka/client/configuration.cc                @redpanda-data/documentation
+/src/v/kafka/client/configuration.h                 @redpanda-data/documentation
+/src/v/pandaproxy/api/api-doc                       @redpanda-data/documentation
+/src/v/pandaproxy/rest/configuration.cc             @redpanda-data/documentation
+/src/v/pandaproxy/rest/configuration.h              @redpanda-data/documentation
+/src/v/pandaproxy/schema_registry/configuration.cc  @redpanda-data/documentation
+/src/v/pandaproxy/schema_registry/configuration.h   @redpanda-data/documentation
+/src/v/redpanda/admin/api-doc                       @redpanda-data/documentation
+
+#
+# automatically tag docs team and API reviewers for any changes to our public proto files
+#
+/proto/redpanda/core/admin/v2/*.proto    @redpanda-data/documentation @redpanda-data/core-enterprise
+/proto/redpanda/core/common/*.proto      @redpanda-data/documentation @redpanda-data/core-enterprise

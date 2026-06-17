@@ -1,0 +1,600 @@
+{
+    "apiVersion": "0.0.1",
+    "swaggerVersion": "1.2",
+    "basePath": "/v1",
+    "resourcePath": "/brokers",
+    "produces": [
+        "application/json"
+    ],
+    "apis": [
+        {
+            "path": "/v1/cluster_view",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get cluster view",
+                    "type": "cluster_view",
+                    "nickname": "get_cluster_view",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/brokers",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get a list of brokers",
+                    "type": "array",
+                    "items": {
+                        "type": "broker"
+                    },
+                    "nickname": "get_brokers",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/broker_uuids",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get a list of node id to UUID mappings",
+                    "type": "array",
+                    "items": {
+                        "type": "broker_uuid_mapping"
+                    },
+                    "nickname": "get_broker_uuids",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/brokers/{id}",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Get broker",
+                    "type": "broker",
+                    "nickname": "get_broker",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "id",
+                            "in": "path",
+                            "required": true,
+                            "type": "long"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/brokers/{id}/decommission",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "get broker decommission progress",
+                    "type": "void",
+                    "nickname": "get_decommission",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "id",
+                            "in": "path",
+                            "required": true,
+                            "type": "long"
+                        }
+                    ]
+                },
+                {
+                    "method": "PUT",
+                    "summary": "decommission broker",
+                    "type": "void",
+                    "nickname": "decommission",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "id",
+                            "in": "path",
+                            "required": true,
+                            "type": "long"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/brokers/{id}/recommission",
+            "operations": [
+                {
+                    "method": "PUT",
+                    "summary": "recommission broker",
+                    "type": "void",
+                    "nickname": "recommission",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "id",
+                            "in": "path",
+                            "required": true,
+                            "type": "long"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/brokers/{id}/maintenance",
+            "operations": [
+                {
+                    "method": "PUT",
+                    "nickname": "start_broker_maintenance",
+                    "summary": "Request broker enter maintenance mode",
+                    "type": "void",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "id",
+                            "in": "path",
+                            "required": true,
+                            "type": "long"
+                        }
+                    ]
+                },
+                {
+                    "method": "DELETE",
+                    "nickname": "stop_broker_maintenance",
+                    "summary": "Request broker exit maintenance mode",
+                    "type": "void",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "id",
+                            "in": "path",
+                            "required": true,
+                            "type": "long"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/brokers/{id}/cancel_partition_moves",
+            "operations": [
+                {
+                    "method": "POST",
+                    "nickname": "cancel_partition_moves",
+                    "summary": "Cancel all partitions movement transferring replicas either to or from given node",
+                    "type": "void",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "name": "id",
+                            "in": "path",
+                            "required": true,
+                            "type": "long"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/maintenance",
+            "operations": [
+                {
+                    "method": "PUT",
+                    "summary": "Force start local maintenance",
+                    "type": "void",
+                    "nickname": "start_local_maintenance",
+                    "produces": [
+                        "application/json"
+                    ]
+                },
+                {
+                    "method": "DELETE",
+                    "summary": "Force stop local maintenance",
+                    "type": "void",
+                    "nickname": "stop_local_maintenance",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                },
+                {
+                    "method": "GET",
+                    "summary": "Get local maintenance status",
+                    "type": "maintenance_status",
+                    "nickname": "get_local_maintenance",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        },
+        {
+            "path": "/v1/reset_crash_tracking",
+            "operations": [
+                {
+                    "method": "PUT",
+                    "summary": "Reset the crash tracking of queried broker.",
+                    "type": "void",
+                    "nickname": "reset_crash_tracking",
+                    "produces": [
+                        "application/json"
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/broker/pre_restart_probe",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Check if it is safe to restart this broker",
+                    "type": "pre_restart_check_result",
+                    "nickname": "pre_restart_probe",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": [
+                        {
+                            "in": "query",
+                            "name": "limit",
+                            "schema": {
+                                "type": "integer"
+                            },
+                            "required": false,
+                            "description": "Limit the number of partitions listed for each risk type. Default is 128."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "path": "/v1/broker/post_restart_probe",
+            "operations": [
+                {
+                    "method": "GET",
+                    "summary": "Check if it this broker has recovered after restart",
+                    "type": "post_restart_check_result",
+                    "nickname": "post_restart_probe",
+                    "produces": [
+                        "application/json"
+                    ],
+                    "parameters": []
+                }
+            ]
+        }
+    ],
+    "models": {
+        "cluster_view": {
+            "id": "cluster_view",
+            "description": "Cluster view",
+            "properties": {
+                "version": {
+                    "type": "long",
+                    "description": "cluster view version"
+                },
+                "brokers": {
+                    "type": "array",
+                    "items": {
+                        "type": "broker"
+                    }
+                }
+            }
+        },
+        "broker": {
+            "id": "broker",
+            "description": "Broker information",
+            "properties": {
+                "node_id": {
+                    "type": "long",
+                    "description": "node id"
+                },
+                "num_cores": {
+                    "type": "long",
+                    "description": "cores"
+                },
+                "rack": {
+                    "type": "string",
+                    "description": "rack id"
+                },
+                "internal_rpc_address": {
+                    "type": "string",
+                    "description": "Internal RPC address (usually, but not necessarily, a hostname)"
+                },
+                "internal_rpc_port": {
+                    "type": "long",
+                    "description": "Internal RPC port"
+                },
+                "membership_status": {
+                    "type": "string",
+                    "description": "Broker membership status"
+                },
+                "is_alive": {
+                    "type": "boolean",
+                    "description": "is node seen as alive by the cluster"
+                },
+                "recovery_mode_enabled": {
+                    "type": "boolean",
+                    "description": "was node booted up in recovery mode"
+                },
+                "disk_space": {
+                    "type": "array",
+                    "items": {
+                        "type": "disk_space_info"
+                    },
+                    "description": "Array of disk space information per directory path. If disk space information is not available the array may be empty"
+                },
+                "version": {
+                    "type": "string",
+                    "description": "Redpanda version"
+                },
+                "maintenance_status": {
+                    "type": "maintenance_status",
+                    "description": "Node maintenance status"
+                },
+                "in_fips_mode": {
+                    "type": "string",
+                    "description": "indicates if node is operating in FIPS Mode"
+                }
+            }
+        },
+        "disk_space_info": {
+            "id": "disk_space_info",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "data directory path"
+                },
+                "free": {
+                    "type": "long",
+                    "description": "free space bytes"
+                },
+                "total": {
+                    "type": "long",
+                    "description": "total space bytes"
+                }
+            }
+        },
+        "maintenance_status": {
+            "id": "maintenance_status",
+            "description": "Status of maintenance mode",
+            "properties": {
+                "draining": {
+                    "type": "boolean",
+                    "description": "Flag indicating if maintenance mode is enabled."
+                },
+                "finished": {
+                    "type": "boolean",
+                    "description": "Indicates that draining is finished. Note that the draining flag will always be true if maintenance mode is enable and draining has finished."
+                },
+                "errors": {
+                    "type": "boolean",
+                    "description": "drain errors"
+                },
+                "partitions": {
+                    "type": "long",
+                    "description": "partition count"
+                },
+                "eligible": {
+                    "type": "long",
+                    "description": "eligible partition count"
+                },
+                "transferring": {
+                    "type": "long",
+                    "description": "transferring partition count"
+                },
+                "failed": {
+                    "type": "long",
+                    "description": "failed transfer partition count"
+                }
+            }
+        },
+        "reallocation_failure_details": {
+            "id": "reallocation_failure_details",
+            "description": "Detailed information about reallocation failure",
+            "properties": {
+                "ns": {
+                    "type": "string",
+                    "description": "namespace"
+                },
+                "topic": {
+                    "type": "string"
+                },
+                "partition": {
+                    "type": "int"
+                },
+                "error": {
+                    "type": "string",
+                    "description": "Reallocation failure description. The description contains the cause of failure"
+                }
+            }
+        },
+        "decommission_status": {
+            "id": "decommission_status",
+            "description": "Node decommissioning status",
+            "properties": {
+                "finished": {
+                    "type": "boolean",
+                    "description": "indicate if decommissioning is finished"
+                },
+                "replicas_left": {
+                    "type": "long",
+                    "description": "number of replicas left on a node"
+                },
+                "allocation_failures": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "description": "ntp"
+                    },
+                    "description": "a subset of partitions originating from this node with allocation failures. "
+                },
+                "partitions": {
+                    "type": "chunked_array",
+                    "items": {
+                        "type": "partition_reconfiguration_status"
+                    },
+                    "description": "Array of partition reconfiguration statuses"
+                },
+                "reallocation_failure_details": {
+                    "type": "array",
+                    "items": {
+                        "type": "reallocation_failure_details"
+                    },
+                    "description": "Array containing allocation failure details. This is helpful for diagnosing node decommissioning problems."
+                }
+            }
+        },
+        "partition_reconfiguration_status": {
+            "id": "partition_reconfiguration_status",
+            "description": "Partition reconfiguration status",
+            "properties": {
+                "ns": {
+                    "type": "string",
+                    "description": "namespace"
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "topic"
+                },
+                "partition": {
+                    "type": "int",
+                    "description": "partition"
+                },
+                "moving_to": {
+                    "type": "broker_shard",
+                    "description": "information where the partition is being moved"
+                },
+                "bytes_left_to_move": {
+                    "type": "long",
+                    "description": "bytes left to move to new replica"
+                },
+                "bytes_moved": {
+                    "type": "long",
+                    "description": "bytes moved to target broker"
+                },
+                "partition_size": {
+                    "type": "long",
+                    "description": "current size of partition"
+                },
+                "reconfiguration_policy": {
+                    "type": "string",
+                    "description": "Policy used to reconfigure partition replica set"
+                }
+            }
+        },
+        "broker_shard": {
+            "id": "broker_shard",
+            "description": "Replica placement",
+            "properties": {
+                "node_id": {
+                    "type": "int",
+                    "description": "id of a node"
+                },
+                "core": {
+                    "type": "int",
+                    "description": "id of a core on a given node"
+                }
+            }
+        },
+        "broker_uuid_mapping": {
+            "id": "broker_uuid_mapping",
+            "description": "Mapping between UUID and node id",
+            "properties": {
+                "node_id": {
+                    "type": "int",
+                    "description": "Broker assigned id"
+                },
+                "uuid": {
+                    "type": "string",
+                    "description": "Broker unique identifier. UUID is generated when Redpanda starts with empty data folder"
+                }
+            }
+        },
+        "pre_restart_check_result": {
+            "id": "pre_restart_check_result",
+            "description": "Pre-restart check result",
+            "properties" : {
+                "risks": {
+                    "type": "restart_risks",
+                    "description": "Partitions affected by the current node restart, arranged by risk type"
+                }
+            }
+        },
+        "post_restart_check_result": {
+            "id": "post_restart_check_result",
+            "description": "Post-restart check result",
+            "properties" : {
+                "load_reclaimed_pc": {
+                    "type": "int",
+                    "description": "Measure the load the broker has reclaimed after a restart as a percentage of in-sync replicas. 0 to 100."
+                }
+            }
+        },
+        "restart_risks": {
+            "id": "restart_risks",
+            "description": "Partitions affected by the current node restart, arranged by risk type (each list is truncated according to the limit specified in the request)",
+            "properties" : {
+                "rf1_offline" : {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "description": "ntp"
+                    },
+                    "description": "Partitions with replication factor 1 that have a replica on current node"
+                },
+                "full_acks_produce_unavailable" : {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "description": "ntp"
+                    },
+                    "description": "Partitions that may reject produce requests (with acks=-1) if the current node is restarted"
+                },
+                "unavailable" : {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "description": "ntp"
+                    },
+                    "description": "Partitions that may reject consume and produce requests if the current node is restarted"
+                },
+                "acks1_data_loss" : {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "description": "ntp"
+                    },
+                    "description": "Partitions that may lose data produced (with acks=1) if the current node is restarted"
+                }
+            }
+        }
+    }
+}

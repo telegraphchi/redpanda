@@ -1,0 +1,149 @@
+// Copyright 2020 Redpanda Data, Inc.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.md
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0
+
+#include "base/units.h"
+#include "bytes/iobuf_parser.h"
+#include "random/generators.h"
+#include "test_utils/random_bytes.h"
+#include "utils/base64.h"
+
+#include <seastar/core/memory.hh>
+
+#include <boost/test/unit_test.hpp>
+
+#include <iterator>
+
+BOOST_AUTO_TEST_CASE(bytes_type) {
+    auto encdec = [](std::string_view input, std::string_view expected) {
+        auto encoded = bytes_to_base64(bytes::from_string(input));
+        BOOST_REQUIRE_EQUAL(encoded, expected);
+        auto decoded = base64_to_bytes(encoded);
+        BOOST_REQUIRE_EQUAL(decoded, bytes::from_string(input));
+    };
+
+    encdec("", "");
+    encdec("this is a string", "dGhpcyBpcyBhIHN0cmluZw==");
+    encdec("a", "YQ==");
+}
+
+BOOST_AUTO_TEST_CASE(iobuf_type) {
+    auto encdec = [](const iobuf& input, const auto expected) {
+        auto encoded = iobuf_to_base64_string(input, input.size_bytes());
+        BOOST_REQUIRE_EQUAL(encoded, expected);
+        auto decoded = base64_to_bytes(encoded);
+        BOOST_REQUIRE_EQUAL(decoded, iobuf_to_bytes(input));
+        auto encoded_buf = iobuf_to_base64(input);
+        BOOST_REQUIRE_EQUAL(encoded_buf, iobuf::from(encoded));
+    };
+
+    encdec(iobuf::from(""), "");
+    encdec(iobuf::from("this is a string"), "dGhpcyBpcyBhIHN0cmluZw==");
+    encdec(iobuf::from("a"), "YQ==");
+
+    // test with multiple iobuf fragments
+    iobuf buf;
+    while (std::distance(buf.begin(), buf.end()) < 3) {
+        auto data = tests::random_bytes(128);
+        buf.append(data.data(), data.size());
+    }
+
+    auto encoded = iobuf_to_base64_string(buf, buf.size_bytes());
+    auto decoded = base64_to_bytes(encoded);
+    BOOST_REQUIRE_EQUAL(decoded, iobuf_to_bytes(buf));
+    auto encoded_buf = iobuf_to_base64(buf);
+    BOOST_REQUIRE_EQUAL(iobuf::from(encoded), encoded_buf);
+
+    auto encdec_limit = [](iobuf input, const auto expected, size_t sz_bytes) {
+        auto encoded = iobuf_to_base64_string(input, sz_bytes);
+        BOOST_REQUIRE_EQUAL(encoded, expected);
+        auto decoded = base64_to_bytes(encoded);
+        BOOST_REQUIRE_EQUAL(decoded, iobuf_to_bytes(input.share(0, sz_bytes)));
+    };
+
+    encdec_limit(iobuf::from("this is a string"), "dGhpcyBpcyA=", 8);
+    encdec_limit(iobuf::from("this"), "dGhpcw==", 8);
+}
+
+BOOST_AUTO_TEST_CASE(test_base64_to_iobuf) {
+    const std::string_view a_string = "dGhpcyBpcyBhIHN0cmluZw==";
+    iobuf buf;
+    const size_t half = a_string.size() / 2;
+    buf.append_fragments(iobuf::from(a_string.substr(0, half)));
+    buf.append_fragments(iobuf::from(a_string.substr(half)));
+    BOOST_REQUIRE_EQUAL(std::distance(buf.begin(), buf.end()), 2);
+
+    auto decoded = base64_to_iobuf(buf);
+    iobuf_parser p{std::move(decoded)};
+    auto decoded_str = p.read_string(p.bytes_left());
+    BOOST_REQUIRE_EQUAL(decoded_str, "this is a string");
+}
+
+BOOST_AUTO_TEST_CASE(test_iobuf_to_base64_allocations) {
+    iobuf buf;
+    for (size_t size : {512_KiB, 512_KiB - 1, 512_KiB + 1}) {
+        std::string large_string = random_generators::gen_alphanum_string(size);
+        auto large_frag = std::make_unique<iobuf::fragment>(
+          large_string.size());
+        large_frag->append(large_string.data(), large_string.size());
+        BOOST_REQUIRE_EQUAL(large_frag->size(), size);
+        buf.append(std::move(large_frag));
+    }
+    BOOST_REQUIRE_EQUAL(std::distance(buf.begin(), buf.end()), 3);
+    auto baseline = ss::memory::stats();
+    ss::memory::scoped_large_allocation_warning_threshold threshold(128_KiB);
+    auto encoded = iobuf_to_base64(buf);
+    auto decoded = base64_to_iobuf(encoded);
+    BOOST_REQUIRE_EQUAL(decoded, buf);
+    auto updated = ss::memory::stats();
+    BOOST_REQUIRE_EQUAL(
+      baseline.large_allocations(), updated.large_allocations());
+}
+
+BOOST_AUTO_TEST_CASE(base64_url_decode_test_basic) {
+    auto dec = [](std::string_view input, std::string_view expected) {
+        auto decoded = base64url_to_bytes(input);
+        BOOST_REQUIRE_EQUAL(decoded, bytes::from_string(expected));
+    };
+
+    dec("UmVkcGFuZGEgUm9ja3M", "Redpanda Rocks");
+    // ChatGPT was asked to describe the Redpanda product
+    dec(
+      "UmVkcGFuZGEgaXMgYSBjdXR0aW5nLWVkZ2UgZGF0YSBzdHJlYW1pbmcgcGxhdGZvcm0gZGVz"
+      "aWduZWQgdG8gb2ZmZXIgYSBoaWdoLXBlcmZvcm1hbmNlIGFsdGVybmF0aXZlIHRvIEFwYWNo"
+      "ZSBLYWZrYS4gSXQncyBjcmFmdGVkIHRvIGhhbmRsZSB2YXN0IGFtb3VudHMgb2YgcmVhbC10"
+      "aW1lIGRhdGEgZWZmaWNpZW50bHksIG1ha2luZyBpdCBhbiBleGNlbGxlbnQgY2hvaWNlIGZv"
+      "ciBtb2Rlcm4gZGF0YS1kcml2ZW4gYXBwbGljYXRpb25zLiAgT3ZlcmFsbCwgUmVkcGFuZGEg"
+      "cmVwcmVzZW50cyBhIGNvbXBlbGxpbmcgb3B0aW9uIGZvciBvcmdhbml6YXRpb25zIHNlZWtp"
+      "bmcgYSBoaWdoLXBlcmZvcm1hbmNlLCBzY2FsYWJsZSwgYW5kIHJlbGlhYmxlIGRhdGEgc3Ry"
+      "ZWFtaW5nIHNvbHV0aW9uLiBXaGV0aGVyIHlvdSdyZSBidWlsZGluZyByZWFsLXRpbWUgYW5h"
+      "bHl0aWNzIGFwcGxpY2F0aW9ucywgcHJvY2Vzc2luZyBJb1QgZGF0YSBzdHJlYW1zLCBvciBt"
+      "YW5hZ2luZyBldmVudC1kcml2ZW4gbWljcm9zZXJ2aWNlcywgUmVkcGFuZGEgaGFzIHlvdSBj"
+      "b3ZlcmVkLg",
+      "Redpanda is a cutting-edge data streaming platform designed to offer a "
+      "high-performance alternative to Apache Kafka. It's crafted to handle "
+      "vast amounts of real-time data efficiently, making it an excellent "
+      "choice for modern data-driven applications.  Overall, Redpanda "
+      "represents a compelling option for organizations seeking a "
+      "high-performance, scalable, and reliable data streaming solution. "
+      "Whether you're building real-time analytics applications, processing "
+      "IoT data streams, or managing event-driven microservices, Redpanda has "
+      "you covered.");
+
+    dec("YQ", "a");
+    dec("YWI", "ab");
+    dec("YWJj", "abc");
+    dec("", "");
+}
+
+BOOST_AUTO_TEST_CASE(base64_url_decode_invalid_character) {
+    const std::string invalid_encode = "abc+/";
+    BOOST_REQUIRE_THROW(
+      base64url_to_bytes(invalid_encode), base64_url_decoder_exception);
+    BOOST_REQUIRE_THROW(base64url_to_bytes("A"), base64_url_decoder_exception);
+}

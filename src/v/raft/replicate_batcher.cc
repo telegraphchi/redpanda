@@ -1,0 +1,419 @@
+// Copyright 2020 Redpanda Data, Inc.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.md
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0
+
+#include "raft/replicate_batcher.h"
+
+#include "container/chunked_vector.h"
+#include "raft/consensus.h"
+#include "raft/replicate_entries_stm.h"
+#include "raft/types.h"
+#include "ssx/future-util.h"
+
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/shared_ptr.hh>
+
+#include <optional>
+
+namespace raft {
+
+replicate_batcher::item::item(
+  size_t record_count,
+  chunked_vector<model::record_batch> batches,
+  ssx::semaphore_units u,
+  replicate_options opts)
+  : _record_count(record_count)
+  , _data(std::move(batches))
+  , _units(std::move(u))
+  , _replicate_opts(opts) {
+    _timeout_timer.set_callback([this] { expire_with_timeout(); });
+    if (_replicate_opts.timeout) {
+        _timeout_timer.arm(_replicate_opts.timeout.value());
+    }
+    if (_replicate_opts.as) [[unlikely]] {
+        _abort_sub = _replicate_opts.as->get().subscribe(
+          [this] noexcept { mark_as_aborted(); });
+        if (!_abort_sub) {
+            mark_as_aborted();
+        }
+    }
+}
+
+void replicate_batcher::item::set_value(result<replicate_result> r) {
+    if (!_ready) {
+        _timeout_timer.cancel();
+        _ready = true;
+        _promise.set_value(r);
+    }
+}
+
+void replicate_batcher::item::set_exception(const std::exception_ptr& e) {
+    if (!_ready) {
+        _timeout_timer.cancel();
+        _ready = true;
+        _promise.set_exception(e);
+    }
+}
+
+void replicate_batcher::item::expire_with_timeout() {
+    if (!_ready) {
+        _ready = true;
+        _data.clear();
+        _units.return_all();
+        _promise.set_value(errc::timeout);
+    }
+}
+
+void replicate_batcher::item::mark_as_aborted() {
+    if (!_ready) {
+        _ready = true;
+        _data.clear();
+        _units.return_all();
+        _promise.set_value(errc::shutting_down);
+    }
+}
+
+using namespace std::chrono_literals; // NOLINT
+replicate_batcher::replicate_batcher(consensus* ptr, size_t cache_size)
+  : _ptr(ptr)
+  , _max_batch_size_sem(cache_size, "raft/repl-batch")
+  , _max_batch_size(cache_size) {}
+
+replicate_stages replicate_batcher::replicate(
+  chunked_vector<model::record_batch> batches, replicate_options opts) {
+    if (opts.as) [[unlikely]] {
+        if (opts.as->get().abort_requested()) {
+            return replicate_stages{
+              ss::make_exception_future<>(ss::abort_requested_exception()),
+              ss::make_ready_future<result<replicate_result>>(
+                errc::shutting_down)};
+        }
+    }
+    ss::promise<> enqueued;
+    auto enqueued_f = enqueued.get_future();
+
+    auto f = cache_and_wait_for_result(
+      std::move(enqueued), std::move(batches), opts);
+    return {std::move(enqueued_f), std::move(f)};
+}
+
+ss::future<result<replicate_result>>
+replicate_batcher::cache_and_wait_for_result(
+  ss::promise<> enqueued,
+  chunked_vector<model::record_batch> r,
+  replicate_options opts) {
+    item_ptr item;
+    try {
+        auto holder = _bg.hold();
+        item = co_await do_cache_with_backpressure(std::move(r), opts);
+
+        // now request is already enqueued, we can release first
+        // stage future
+        enqueued.set_value();
+
+        /**
+         * Dispatching flush in a background.
+         *
+         * The batcher mutex may be grabbed without the timeout as each item
+         * has its own timeout timer. The shutdown related exceptions may be
+         * ignored here as all pending item promises will be completed in
+         * replicate batcher stop method
+         *
+         */
+        if (!_flush_pending) {
+            _flush_pending = true;
+            ssx::background = ssx::spawn_with_gate_then(_bg, [this]() {
+                return _lock.get_units()
+                  .then([this](auto units) {
+                      return flush(std::move(units), false);
+                  })
+                  .handle_exception([this](const std::exception_ptr& e) {
+                      // an exception here is quite unlikely, since the flush()
+                      // method generally catches all its exceptions and
+                      // propagates them to the promises associated with the
+                      // items being flushed
+                      vlog(
+                        _ptr->_ctxlog.error,
+                        "Error in background flush: {}",
+                        e);
+                  });
+            });
+        }
+    } catch (...) {
+        // exception in caching phase
+        enqueued.set_to_current_exception();
+        co_return errc::replicate_batcher_cache_error;
+    }
+
+    co_return co_await item->get_future();
+}
+
+ss::future<> replicate_batcher::stop() {
+    return _bg.close().then([this] {
+        // we keep a lock here to make sure that all inflight requests have
+        // finished already
+        return _lock.with([this] {
+            for (auto& i : _item_cache) {
+                i->set_exception(
+                  std::make_exception_ptr(ss::gate_closed_exception()));
+            }
+            _item_cache.clear();
+        });
+    });
+}
+
+ss::future<replicate_batcher::item_ptr>
+replicate_batcher::do_cache_with_backpressure(
+  chunked_vector<model::record_batch> batches, replicate_options opts) {
+    size_t bytes = 0;
+    size_t record_count = 0;
+    for (const auto& b : batches) {
+        bytes += b.size_bytes();
+        record_count += b.record_count();
+    }
+    /**
+     * Produce a message larger than the internal raft batch accumulator
+     * (default 1Mb) the semaphore can't be acquired. Closing
+     * the connection doesn't propagate this error and allow those units to be
+     * returned, so the entire partition is no longer writable.
+     * see:
+     *
+     * https://github.com/redpanda-data/redpanda/issues/1503.
+     *
+     * When batch size exceed available semaphore units we just acquire all of
+     * them to be able to continue.
+     */
+    ssx::semaphore_units u;
+    if (opts.timeout) {
+        u = co_await ss::get_units(
+          _max_batch_size_sem,
+          std::min(bytes, _max_batch_size),
+          ssx::semaphore::clock::now() + opts.timeout.value());
+    } else {
+        u = co_await ss::get_units(
+          _max_batch_size_sem, std::min(bytes, _max_batch_size));
+    }
+
+    auto i = ss::make_lw_shared<item>(
+      record_count, std::move(batches), std::move(u), opts);
+
+    _item_cache.emplace_back(i);
+    co_return i;
+}
+
+ss::future<> replicate_batcher::flush(
+  ssx::semaphore_units batcher_units, const bool transfer_flush) {
+    auto item_cache = std::exchange(_item_cache, {});
+    // this function should not throw, nor return exceptional futures,
+    // since it is usually invoked in the background and there is
+    // nowhere suitable to
+    try {
+        _flush_pending = false;
+        if (item_cache.empty()) {
+            co_return;
+        }
+        auto u = co_await _ptr->_op_lock.get_units();
+
+        if (!transfer_flush && _ptr->_transferring_leadership) {
+            vlog(_ptr->_ctxlog.warn, "Dropping flush, leadership transferring");
+            for (auto& n : item_cache) {
+                n->set_value(errc::not_leader);
+            }
+            co_return;
+        }
+
+        // release batcher replicate batcher lock
+        batcher_units.return_all();
+        // we have to check if we are the leader
+        // it is critical as term could have been updated already by
+        // vote request and entries from current node could be accepted
+        // by the followers while it is no longer a leader
+        // this problem caused truncation failure.
+
+        if (!_ptr->is_elected_leader()) {
+            for (auto& n : item_cache) {
+                n->set_value(errc::not_leader);
+            }
+            co_return;
+        }
+
+        auto meta = _ptr->meta();
+        const auto term = model::term_id(meta.term);
+        chunked_vector<model::record_batch> data;
+        std::vector<item_ptr> notifications;
+        ssx::semaphore_units item_memory_units(_max_batch_size_sem, 0);
+        auto force_flush_requested = false;
+        auto has_quorum_ack_requests = false;
+
+        for (auto& n : item_cache) {
+            if (unlikely(n->ready())) {
+                continue;
+            }
+            if (
+              !n->get_expected_term().has_value()
+              || n->get_expected_term().value() == term) {
+                auto [batches, units] = n->release_data();
+                item_memory_units.adopt(std::move(units));
+                force_flush_requested = force_flush_requested
+                                        || n->force_flush_requested();
+                has_quorum_ack_requests
+                  = has_quorum_ack_requests
+                    || (n->get_consistency_level() == consistency_level::quorum_ack);
+                for (auto& b : batches) {
+                    b.set_term(term);
+                    data.push_back(std::move(b));
+                }
+                notifications.push_back(std::move(n));
+            } else {
+                n->set_value(errc::not_leader);
+            }
+        }
+
+        if (notifications.empty()) {
+            co_return;
+        }
+
+        auto needs_flush = flush_after_append::no;
+        auto write_caching_enabled = _ptr->write_caching_enabled();
+        // We flush in the following cases
+        // 1. an explicit force flush was requested by one of the items. eg:
+        // transactions
+        // 2. there is atleast one quorum ack request *and* write caching is
+        // disabled.
+        if (
+          force_flush_requested
+          || (has_quorum_ack_requests && !write_caching_enabled)) {
+            needs_flush = flush_after_append::yes;
+        }
+
+        auto seqs = _ptr->next_followers_request_seq();
+        append_entries_request req(
+          _ptr->_self,
+          meta,
+          std::move(data),
+          item_memory_units.count(),
+          needs_flush);
+
+        std::vector<ssx::semaphore_units> units;
+        units.reserve(2);
+        units.push_back(std::move(u));
+        // we will release memory semaphore as soon as append entry
+        // requests will be dispatched
+        units.push_back(std::move(item_memory_units));
+        co_await do_flush(
+          std::move(notifications),
+          std::move(req),
+          std::move(units),
+          std::move(seqs));
+    } catch (...) {
+        for (auto& i : item_cache) {
+            i->set_exception(std::current_exception());
+        }
+        co_return;
+    }
+}
+
+template<typename Predicate>
+static void propagate_result(
+  result<replicate_result> r,
+  std::vector<replicate_batcher::item_ptr>& notifications,
+  const Predicate& pred) {
+    if (r.has_error()) {
+        // propagate an error
+        for (auto& n : notifications) {
+            n->set_value(r.error());
+        }
+        return;
+    }
+
+    // iterate backward to calculate last offsets
+    auto last_offset = r.value().last_offset;
+    auto last_term = r.value().last_term;
+    for (auto it = notifications.rbegin(); it != notifications.rend(); ++it) {
+        if (pred(*it)) {
+            (*it)->set_value(replicate_result{last_offset, last_term});
+        }
+        last_offset = last_offset - model::offset((*it)->get_record_count());
+    }
+}
+
+static void propagate_current_exception(
+  std::vector<replicate_batcher::item_ptr>& notifications) {
+    // iterate backward to calculate last offsets
+    auto e = std::current_exception();
+    for (auto& n : notifications) {
+        n->set_exception(e);
+    }
+}
+
+ss::future<> replicate_batcher::do_flush(
+  std::vector<replicate_batcher::item_ptr> notifications,
+  append_entries_request req,
+  std::vector<ssx::semaphore_units> u,
+  absl::flat_hash_map<vnode, follower_req_seq> seqs) {
+    _ptr->_probe->replicate_batch_flushed();
+    auto stm = ss::make_lw_shared<replicate_entries_stm>(
+      _ptr, std::move(req), std::move(seqs));
+    try {
+        auto holder = _bg.hold();
+        auto leader_result = co_await stm->apply(std::move(u));
+
+        /**
+         * First phase, if leader result has error just propagate error
+         * otherwise propagate result to relaxed consistency requests
+         */
+        propagate_result(
+          leader_result, notifications, [](const item_ptr& item) {
+              return item->get_consistency_level()
+                       == consistency_level::leader_ack
+                     || item->get_consistency_level()
+                          == consistency_level::no_ack;
+          });
+        /**
+         * Second phase, wait for majority to replicate if leader result has
+         * error just propagate error otherwise propagate results to relaxed
+         * consistency requests.
+         *
+         * NOTE: this happens in background since we do not want to block
+         * replicate batcher
+         */
+        if (leader_result) {
+            (void)stm->wait_for_majority()
+              .then([holder = std::move(holder),
+                     notifications = std::move(notifications)](
+                      result<replicate_result> quorum_result) mutable {
+                  propagate_result(
+                    quorum_result, notifications, [](const item_ptr& item) {
+                        return item->get_consistency_level()
+                               == consistency_level::quorum_ack;
+                    });
+              })
+              .finally([stm] {});
+        }
+    } catch (...) {
+        propagate_current_exception(notifications);
+    }
+
+    auto f = stm->wait_for_shutdown().finally([stm] {});
+    if (_bg.is_closed()) {
+        _ptr->_ctxlog.info(
+          "gate-closed, waiting to finish background requests");
+        co_return co_await std::move(f);
+    }
+    ssx::spawn_with_gate(_bg, [this, stm, f = std::move(f)]() mutable {
+        return std::move(f).handle_exception(
+          [this](const std::exception_ptr& e) {
+              _ptr->_ctxlog.debug(
+                "Error waiting for background acks to finish - {}", e);
+          });
+    });
+}
+
+} // namespace raft

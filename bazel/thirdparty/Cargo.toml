@@ -1,0 +1,14 @@
+[workspace]
+[package]
+name = "thirdparty"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+# Use a fake path here, but rules_rust requires something.
+path = "./dev/null"
+
+[dependencies]
+wasmtime-c-api = { version = "42.0.2", package = "wasmtime-c-api-impl", default-features = false, features = ["async", "addr2line", "wat", "cranelift", "gc", "gc-drc"] }
+wasmtime = { version = "42.0.2", package = "wasmtime", default-features = false, features = ["async", "addr2line", "wat", "cranelift", "gc", "gc-drc"] }

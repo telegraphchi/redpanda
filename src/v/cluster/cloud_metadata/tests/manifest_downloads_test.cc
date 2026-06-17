@@ -1,0 +1,223 @@
+/*
+ * Copyright 2023 Redpanda Data, Inc.
+ *
+ * Licensed as a Redpanda Enterprise file under the Redpanda Community
+ * License (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ * https://github.com/redpanda-data/redpanda/blob/master/licenses/rcl.md
+ */
+
+#include "cloud_io/tests/s3_imposter.h"
+#include "cloud_storage/remote.h"
+#include "cluster/cloud_metadata/cluster_manifest.h"
+#include "cluster/cloud_metadata/key_utils.h"
+#include "cluster/cloud_metadata/manifest_downloads.h"
+#include "cluster/cloud_metadata/tests/manual_mixin.h"
+#include "model/fundamental.h"
+#include "redpanda/application.h"
+#include "redpanda/tests/fixture.h"
+#include "utils/retry_chain_node.h"
+
+#include <gtest/gtest.h>
+
+namespace {
+static ss::abort_source never_abort;
+} // anonymous namespace
+
+using namespace cluster::cloud_metadata;
+
+class cluster_metadata_fixture
+  : public s3_imposter_fixture
+  , public manual_metadata_upload_mixin
+  , public redpanda_thread_fixture
+  , public enable_cloud_storage_fixture
+  , public ::testing::Test {
+public:
+    cluster_metadata_fixture()
+      : redpanda_thread_fixture(
+          redpanda_thread_fixture::init_cloud_storage_tag{},
+          httpd_port_number())
+      , remote(app.cloud_storage_api.local())
+      , bucket(cloud_storage_clients::bucket_name("test-bucket")) {
+        set_expectations_and_listen({});
+        wait_for_controller_leadership().get();
+        tests::cooperative_spin_wait_with_timeout(5s, [this] {
+            return app.storage.local().get_cluster_uuid().has_value();
+        }).get();
+        cluster_uuid = app.storage.local().get_cluster_uuid().value();
+    }
+
+    cloud_storage::remote& remote;
+    const cloud_storage_clients::bucket_name bucket;
+    model::cluster_uuid cluster_uuid;
+};
+
+// Basic check for downloading the latest manifest. The manifest downloaded by
+// the uploader should be the one with the highest metadata ID.
+TEST_F(cluster_metadata_fixture, test_download_manifest) {
+    // First try download when there's nothing in the bucket, e.g. as if it's
+    // the first time we're using the bucket for this cluster.
+    retry_chain_node retry_node(
+      never_abort, ss::lowres_clock::time_point::max(), 10ms);
+    auto m_res = download_highest_manifest_for_cluster(
+                   remote, cluster_uuid, bucket, retry_node)
+                   .get();
+    ASSERT_TRUE(m_res.has_error());
+    ASSERT_EQ(m_res.error(), error_outcome::no_matching_metadata);
+
+    // Every manifest upload thereafter should lead a subsequent sync to
+    // download the latest metadata, even if the manifests are left around.
+    cluster_metadata_manifest manifest;
+    manifest.cluster_uuid = cluster_uuid;
+    for (int i = 0; i < 20; i += 2) {
+        manifest.metadata_id = cluster_metadata_id(i);
+        // As a sanity check, upload directly rather than using uploader APIs.
+        remote
+          .upload_manifest(
+            cloud_storage_clients::bucket_name("test-bucket"),
+            manifest,
+            manifest.get_manifest_path(),
+            retry_node)
+          .get();
+
+        // Downloading the manifest should always yield the manifest with the
+        // highest metadata ID.
+        auto m_res = download_highest_manifest_for_cluster(
+                       remote, cluster_uuid, bucket, retry_node)
+                       .get();
+        ASSERT_TRUE(m_res.has_value());
+        EXPECT_EQ(i, m_res.value().metadata_id());
+    }
+
+    // Now set the deadline to something very low, and check that it fails.
+    retry_chain_node timeout_retry_node(
+      never_abort, ss::lowres_clock::time_point::min(), 10ms);
+    m_res = download_highest_manifest_for_cluster(
+              remote, cluster_uuid, bucket, timeout_retry_node)
+              .get();
+    ASSERT_TRUE(m_res.has_error());
+    ASSERT_EQ(error_outcome::list_failed, m_res.error());
+}
+
+TEST_F(cluster_metadata_fixture, test_download_highest_manifest_in_bucket) {
+    retry_chain_node retry_node(
+      never_abort, ss::lowres_clock::time_point::max(), 10ms);
+    auto m_res = download_highest_manifest_in_bucket(
+                   remote, bucket, retry_node, std::nullopt)
+                   .get();
+    ASSERT_TRUE(m_res.has_error());
+    ASSERT_EQ(m_res.error(), error_outcome::no_matching_metadata);
+
+    cluster_metadata_manifest manifest;
+    manifest.cluster_uuid = cluster_uuid;
+    manifest.metadata_id = cluster_metadata_id(10);
+    remote
+      .upload_manifest(
+        cloud_storage_clients::bucket_name("test-bucket"),
+        manifest,
+        manifest.get_manifest_path(),
+        retry_node)
+      .get();
+
+    m_res = download_highest_manifest_in_bucket(
+              remote, bucket, retry_node, std::nullopt)
+              .get();
+    ASSERT_TRUE(m_res.has_value());
+    EXPECT_EQ(cluster_uuid, m_res.value().cluster_uuid);
+    EXPECT_EQ(10, m_res.value().metadata_id());
+
+    auto new_uuid = model::cluster_uuid(uuid_t::create());
+    manifest.cluster_uuid = new_uuid;
+    manifest.metadata_id = cluster_metadata_id(15);
+
+    // Upload a new manifest with a higher metadata ID for a new cluster.
+    remote
+      .upload_manifest(
+        cloud_storage_clients::bucket_name("test-bucket"),
+        manifest,
+        manifest.get_manifest_path(),
+        retry_node)
+      .get();
+    m_res = download_highest_manifest_in_bucket(
+              remote, bucket, retry_node, std::nullopt)
+              .get();
+    ASSERT_TRUE(m_res.has_value());
+    ASSERT_EQ(15, m_res.value().metadata_id());
+    ASSERT_EQ(new_uuid, m_res.value().cluster_uuid);
+
+    // Sanity check that searching by the cluster UUIDs return the expected
+    // manifests.
+    m_res = download_highest_manifest_for_cluster(
+              remote, cluster_uuid, bucket, retry_node)
+              .get();
+    ASSERT_TRUE(m_res.has_value());
+    ASSERT_EQ(10, m_res.value().metadata_id());
+    ASSERT_EQ(cluster_uuid, m_res.value().cluster_uuid);
+
+    m_res = download_highest_manifest_for_cluster(
+              remote, new_uuid, bucket, retry_node)
+              .get();
+    ASSERT_TRUE(m_res.has_value());
+    ASSERT_EQ(15, m_res.value().metadata_id());
+    ASSERT_EQ(new_uuid, m_res.value().cluster_uuid);
+
+    {
+        SCOPED_TRACE(
+          "Should not match any metadata if non-existing cluster name is "
+          "given");
+        auto m_res = download_highest_manifest_in_bucket(
+                       remote, bucket, retry_node, "foo-cluster")
+                       .get();
+        ASSERT_TRUE(m_res.has_error());
+        ASSERT_EQ(error_outcome::no_matching_metadata, m_res.error());
+    }
+
+    {
+        SCOPED_TRACE(
+          "Should fail download when cluster name is not given but they are "
+          "used in the bucket");
+        cloud_io::transfer_details ref_td{
+          .bucket = bucket,
+          .key = cluster_name_ref_for_uuid_key("foo-cluster", cluster_uuid),
+          .parent_rtc = retry_node,
+        };
+        auto ref_upload_result
+          = remote
+              .upload_object({
+                .transfer_details = std::move(ref_td),
+                .type = cloud_storage::upload_type::object,
+                // Empty payload. All the information is encoded in the key.
+                .payload = iobuf{},
+              })
+              .get();
+        ASSERT_EQ(cloud_storage::upload_result::success, ref_upload_result);
+
+        auto m_res = download_highest_manifest_in_bucket(
+                       remote, bucket, retry_node, std::nullopt)
+                       .get();
+        ASSERT_TRUE(m_res.has_error());
+        ASSERT_EQ(error_outcome::misconfiguration, m_res.error());
+    }
+
+    {
+        SCOPED_TRACE("Should match metadata if existing cluster name is given");
+        auto m_res = download_highest_manifest_in_bucket(
+                       remote, bucket, retry_node, "foo-cluster")
+                       .get();
+        ASSERT_TRUE(m_res.has_value());
+        ASSERT_EQ(10, m_res.value().metadata_id());
+        ASSERT_EQ(cluster_uuid, m_res.value().cluster_uuid);
+    }
+
+    {
+        SCOPED_TRACE(
+          "Should not match any metadata if non-existing cluster name is "
+          "given");
+        auto m_res = download_highest_manifest_in_bucket(
+                       remote, bucket, retry_node, "bar-cluster")
+                       .get();
+        ASSERT_TRUE(m_res.has_error());
+        ASSERT_EQ(error_outcome::no_matching_metadata, m_res.error());
+    }
+}

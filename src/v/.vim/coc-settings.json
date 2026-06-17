@@ -1,0 +1,4 @@
+{
+  "clangd.path": "../../tools/clangd",
+  "clangd.compilationDatabaseCandidates": ["../../"]
+}

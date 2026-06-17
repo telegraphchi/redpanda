@@ -1,0 +1,113 @@
+project_name: rpk
+builds:
+  # rpk-windows-and-linux is deprecated; will be replaced by rpk-windows, rpk-linux, rpk-linux-microsoft-go
+  - id: rpk-windows-and-linux
+    dir: ./rpk/
+    main: ./cmd/rpk
+    binary: rpk
+    ldflags:
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.version={{.Tag}}
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.rev={{.ShortCommit}}
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.buildTime={{.Date}}
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/container/containerutil.tag={{.Tag}}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - windows
+      - linux
+    goarch:
+      - amd64
+      - arm64
+  - id: rpk-linux-microsoft-go
+    dir: ./rpk/
+    main: ./cmd/rpk
+    binary: rpk
+    ldflags:
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.version={{.Tag}}
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.rev={{.ShortCommit}}
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.buildTime={{.Date}}
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/container/containerutil.tag={{.Tag}}
+    env:
+      - 'CGO_ENABLED={{ if index .Env "CGO_ENABLED" }}{{ .Env.CGO_ENABLED }}{{ else }}0{{ end }}'
+    tags:
+      - fips
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+  - id: rpk-linux
+    dir: ./rpk/
+    main: ./cmd/rpk
+    binary: rpk
+    ldflags:
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.version={{.Tag}}
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.rev={{.ShortCommit}}
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.buildTime={{.Date}}
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/container/containerutil.tag={{.Tag}}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+  - id: rpk-windows
+    dir: ./rpk/
+    main: ./cmd/rpk
+    binary: rpk
+    ldflags:
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.version={{.Tag}}
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.rev={{.ShortCommit}}
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.buildTime={{.Date}}
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/container/containerutil.tag={{.Tag}}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - windows
+    goarch:
+      - amd64
+      - arm64
+  - id: rpk-darwin
+    dir: ./rpk/
+    main: ./cmd/rpk
+    binary: rpk
+    ldflags:
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.version={{.Tag}}
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.rev={{.ShortCommit}}
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/version.buildTime={{.Date}}
+      - -X github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/container/containerutil.tag={{.Tag}}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    hooks:
+      post:
+        # The binary is signed and notarized when running a production release, but for snapshot builds notarization is
+        # skipped and only ad-hoc signing is performed (not cryptographic material is needed).
+        #
+        # note: environment variables required for signing and notarization (set in CI) but are not needed for snapshot builds
+        #    QUILL_SIGN_P12, QUILL_SIGN_PASSWORD, QUILL_NOTARY_KEY, QUILL_NOTARY_KEY_ID, QUILL_NOTARY_ISSUER
+        - cmd: quill sign-and-notarize "{{ .Path }}" --dry-run={{ .IsSnapshot }} --ad-hoc={{ .IsSnapshot }} -vv
+          env:
+            - QUILL_LOG_FILE=dist/quill-{{ .Target }}.log
+archives:
+  - id: rpk-zip
+    builds:
+      - rpk-windows-and-linux
+      - rpk-darwin
+    format: zip
+    name_template: "rpk-{{ .Os }}-{{ .Arch }}"
+release:
+  github:
+    owner: redpanda-data
+    name: redpanda
+  ids:
+    - rpk-zip
+  draft: true
+  discussion_category_name: Releases
+announce:
+  skip: "true"

@@ -1,0 +1,441 @@
+// Copyright 2025 Redpanda Data, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package redpanda.core.admin.internal.cloud_topics.v1;
+
+import "proto/redpanda/core/pbgen/options.proto";
+import "proto/redpanda/core/pbgen/rpc.proto";
+import "proto/redpanda/core/common/v1/ntp.proto";
+
+option (pbgen.cpp_namespace) = "proto::admin::metastore";
+
+// Admin endpoints to interact with the L1 metastore for Cloud Topics.
+//
+// The metastore contains metadata about cloud topic partitions and the L1
+// objects in which they store their data. It is designed to be a simple state
+// store, performing atomic updates to state and answering simple queries for
+// callers. The metastore itself isn't meant to perform complex partition
+// storage management tasks (e.g. garbage collection or compaction), but rather
+// it exposes primitives to enable robustly performing such tasks.
+//
+// At a high level, the metastore contains the following metadata:
+// - a fixed set of information about each Kafka partition (e.g. start offset,
+//   next offset),
+// - the set of extents (pointers into L1 objects) associated with each Kafka
+//   partition, with enough metadata to find an L1 object by offset or
+//   timestamp,
+// - the set of L1 objects and some information about them to enable efficient
+//   object downloads (e.g. footer location).
+//
+// While callers should generally avoid sending invalid requests to the
+// metastore (e.g. creating gaps in offset space), it is up to the metastore
+// implementation to ensure such requests are rejected and don't have harmful
+// side effects. As such, callers can think of this interface as thread safe.
+service MetastoreService {
+    // Get the start and next offsets for a set of topic partitions in the Kafka
+    // namespace. If the metastore contains no data for this NTP then a not
+    // found error will be thrown.
+    rpc GetOffsets(GetOffsetsRequest) returns (GetOffsetsResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER
+        };
+    }
+
+    // Get the size in bytes of a topic partition in the Kafka namespace. If
+    // the metastore contains no data for this NTP then a not found error will
+    // be thrown.
+    rpc GetSize(GetSizeRequest) returns (GetSizeResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER
+        };
+    }
+
+    // Get database statistics for the metastore database.
+    // Returns detailed size information about the LSM tree including
+    // memtable sizes and per-level breakdowns.
+    rpc GetDatabaseStats(GetDatabaseStatsRequest)
+        returns (GetDatabaseStatsResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER
+        };
+    }
+
+    // Write or delete arbitrary rows in the LSM metastore database.
+    // Enables manual repair and debugging of metastore state.
+    rpc WriteRows(WriteRowsRequest) returns (WriteRowsResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER
+        };
+    }
+
+    // Read rows from the LSM metastore database, decoding raw key/value
+    // pairs into typed protobuf messages. Supports pagination.
+    rpc ReadRows(ReadRowsRequest) returns (ReadRowsResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER
+        };
+    }
+
+    // List cloud topics from the topic table, returning their names, UUIDs,
+    // and partition counts. Supports pagination by topic name.
+    rpc ListCloudTopics(ListCloudTopicsRequest)
+        returns (ListCloudTopicsResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER
+        };
+    }
+
+    // Validate metastore state for a single partition. Checks invariants
+    // such as extent contiguity, offset bounds, and term ordering.
+    // Supports pagination via max_extents and resume_after_offset to
+    // bound the work per call. Cross-page contiguity is enforced by
+    // checking the boundary between consecutive pages.
+    rpc ValidatePartition(ValidatePartitionRequest)
+        returns (ValidatePartitionResponse) {
+        option (pbgen.rpc) = {
+            authz: SUPERUSER
+        };
+    }
+}
+
+// GetOffsetsRequest is the request for looking up the offsets in the metastore
+// for a topic partition.
+message GetOffsetsRequest {
+    // The topic partition to lookup the offstes for.
+    common.v1.TopicPartition partition = 1;
+}
+
+// GetOffsetsResponse is the response for looking up the offsets in the
+// metastore.
+message GetOffsetsResponse {
+    // The offsets for this ntp in the metastore.
+    Offsets offsets = 2;
+}
+
+// The range of offsets stored in the metastore.
+message Offsets {
+    // The first offset available in the metastore.
+    int64 start_offset = 1;
+    // The next offset expected to be written to the metastore. It is
+    // the exclusive upper bound of what is stored in the metastore.
+    int64 next_offset = 2;
+}
+
+// GetSizeRequest is the request for looking up the size in bytes in the
+// metastore for a topic partition.
+message GetSizeRequest {
+    // The topic partition to lookup the size for.
+    common.v1.TopicPartition partition = 1;
+}
+
+// GetSizeResponse is the response for looking up the size in the metastore.
+message GetSizeResponse {
+    // The size in bytes of this partition in the metastore.
+    uint64 size_bytes = 1;
+}
+
+// GetDatabaseStatsRequest is the request for looking up LSM storage statistics.
+message GetDatabaseStatsRequest {
+    // The metastore partition to query. Defaults to partition 0 if not
+    // specified.
+    uint32 metastore_partition = 1;
+}
+
+// GetDatabaseStatsResponse contains detailed LSM storage statistics.
+message GetDatabaseStatsResponse {
+    // Size of the active memtable (data not yet flushed).
+    uint64 active_memtable_bytes = 1;
+    // Size of the immutable memtable (data being flushed).
+    uint64 immutable_memtable_bytes = 2;
+    // Total size including memtables and all levels.
+    uint64 total_size_bytes = 3;
+    // Per-level file information for the LSM tree.
+    repeated LsmLevel levels = 4;
+}
+
+// Information about a single level in the LSM tree.
+message LsmLevel {
+    // The level number (0 for L0, 1 for L1, etc).
+    int32 level_number = 1;
+    // Files in this level.
+    repeated LsmFile files = 2;
+}
+
+// Summary information about a single SST file.
+message LsmFile {
+    // Database epoch when the file was created.
+    uint64 epoch = 1;
+    // File ID.
+    uint64 id = 2;
+    // File size in bytes.
+    uint64 size_bytes = 3;
+    // Smallest key in the file (human-readable string representation).
+    string smallest_key_info = 4;
+    // Largest key in the file (human-readable string representation).
+    string largest_key_info = 5;
+}
+
+// Key for a metadata row (partition-level metadata).
+message MetadataKey {
+    string topic_id = 1;
+    int32 partition_id = 2;
+}
+
+// Key for an extent row (pointer into an L1 object).
+message ExtentKey {
+    string topic_id = 1;
+    int32 partition_id = 2;
+    int64 base_offset = 3;
+}
+
+// Key for a term row (term-to-offset mapping).
+message TermKey {
+    string topic_id = 1;
+    int32 partition_id = 2;
+    int64 term_id = 3;
+}
+
+// Key for a compaction row (compaction state for a partition).
+message CompactionKey {
+    string topic_id = 1;
+    int32 partition_id = 2;
+}
+
+// Key for an object row (object-level metadata).
+message ObjectKey {
+    string object_id = 1;
+}
+
+// A typed key for a metastore row.
+message RowKey {
+    oneof key {
+        MetadataKey metadata = 1;
+        ExtentKey extent = 2;
+        TermKey term = 3;
+        CompactionKey compaction = 4;
+        ObjectKey object = 5;
+    }
+}
+
+// Value for a metadata row.
+message MetadataValue {
+    int64 start_offset = 1;
+    int64 next_offset = 2;
+    int64 compaction_epoch = 3;
+    uint64 size = 4;
+    uint64 num_extents = 5;
+}
+
+// Value for an extent row.
+message ExtentValue {
+    int64 last_offset = 1;
+    int64 max_timestamp = 2;
+    uint64 filepos = 3;
+    uint64 len = 4;
+    string object_id = 5;
+}
+
+// Value for a term row.
+message TermValue {
+    int64 term_start_offset = 1;
+}
+
+// An inclusive offset range.
+message OffsetRange {
+    int64 base_offset = 1;
+    int64 last_offset = 2;
+}
+
+// A cleaned range that may contain tombstones.
+message CleanedRangeWithTombstones {
+    int64 base_offset = 1;
+    int64 last_offset = 2;
+    int64 cleaned_with_tombstones_at = 3;
+}
+
+// Value for a compaction row.
+message CompactionValue {
+    repeated OffsetRange cleaned_ranges = 1;
+    repeated CleanedRangeWithTombstones cleaned_ranges_with_tombstones = 2;
+}
+
+// Value for an object row.
+message ObjectValue {
+    uint64 total_data_size = 1;
+    uint64 removed_data_size = 2;
+    uint64 footer_pos = 3;
+    uint64 object_size = 4;
+    int64 last_updated = 5;
+    bool is_preregistration = 6;
+}
+
+// A typed value for a metastore row.
+message RowValue {
+    oneof value {
+        MetadataValue metadata = 1;
+        ExtentValue extent = 2;
+        TermValue term = 3;
+        CompactionValue compaction = 4;
+        ObjectValue object = 5;
+    }
+}
+
+// A row to write (upsert) to the metastore.
+message WriteRow {
+    RowKey key = 1;
+    RowValue value = 2;
+}
+
+// WriteRowsRequest writes or deletes arbitrary rows in the metastore.
+message WriteRowsRequest {
+    // The metastore partition to write to.
+    uint32 metastore_partition = 1;
+    // Rows to upsert.
+    repeated WriteRow writes = 2;
+    // Keys to delete (tombstone).
+    repeated RowKey deletes = 3;
+}
+
+// WriteRowsResponse is the response for writing rows.
+message WriteRowsResponse {
+    // The number of rows written (including deletes).
+    uint32 rows_written = 1;
+}
+
+// A row read from the metastore, with decoded key and value.
+message ReadRow {
+    RowKey key = 1;
+    RowValue value = 2;
+}
+
+// ReadRowsRequest reads and decodes rows from the LSM metastore database.
+message ReadRowsRequest {
+    // The metastore partition to read from.
+    uint32 metastore_partition = 1;
+    // Optional seek key. If omitted, scan from the beginning.
+    oneof seek {
+        RowKey seek_key = 2;
+        string raw_seek_key = 3;
+    }
+    // Optional upper bound. If omitted, scan until max_rows is hit.
+    oneof last {
+        RowKey last_key = 4;
+        string raw_last_key = 5;
+    }
+    // Maximum number of rows to return. 0 uses a default of 100.
+    uint32 max_rows = 6;
+}
+
+// ReadRowsResponse is the response for reading rows.
+message ReadRowsResponse {
+    // The decoded rows.
+    repeated ReadRow rows = 1;
+    // Raw key for the next page. Empty if no more rows.
+    string next_key = 2;
+}
+
+// ValidatePartitionRequest validates metastore invariants for a single
+// partition. Supports paginated validation via max_extents and
+// resume_at_offset.
+message ValidatePartitionRequest {
+    // The topic UUID to validate.
+    string topic_id = 1;
+    // The partition ID to validate.
+    int32 partition_id = 2;
+    // If true, verify each extent's object_id exists in the metastore
+    // object table and is not a preregistration.
+    bool check_object_metadata = 3;
+    // If true, verify each extent's L1 object exists in cloud storage
+    // via HEAD request.
+    bool check_object_storage = 4;
+    // Resume validation at this base_offset (inclusive). On the next
+    // page, the validator re-reads the extent at this offset to verify
+    // cross-page contiguity, then continues forward. The re-read extent
+    // is not counted toward max_extents. Omit to start from the
+    // beginning of the partition.
+    optional int64 resume_at_offset = 5;
+    // Max extents to validate per call (excluding the re-read extent on
+    // continuation pages). 0 means validate all remaining extents.
+    uint32 max_extents = 6;
+}
+
+// ValidatePartitionResponse contains the results of partition validation.
+message ValidatePartitionResponse {
+    // Anomalies found during validation. Empty if the partition is valid.
+    repeated MetastoreAnomaly anomalies = 1;
+    // The base_offset of the last extent validated. If absent, all
+    // extents have been validated. Pass this value as resume_at_offset
+    // in the next call to continue validation.
+    optional int64 resume_at_offset = 2;
+    // Number of extents validated in this call (excluding the re-read
+    // extent on continuation pages).
+    uint32 extents_validated = 3;
+}
+
+// Type of anomaly found during metastore validation.
+enum AnomalyType {
+    ANOMALY_TYPE_UNSPECIFIED = 0;
+    ANOMALY_TYPE_EXTENT_OVERLAP = 1;
+    ANOMALY_TYPE_EXTENT_GAP = 2;
+    ANOMALY_TYPE_NEXT_OFFSET_MISMATCH = 3;
+    ANOMALY_TYPE_START_OFFSET_MISMATCH = 4;
+    ANOMALY_TYPE_OBJECT_NOT_FOUND = 5;
+    ANOMALY_TYPE_OBJECT_PREREGISTERED = 6;
+    ANOMALY_TYPE_OBJECT_NOT_IN_STORAGE = 7;
+    ANOMALY_TYPE_COMPACTION_RANGE_BELOW_START = 8;
+    ANOMALY_TYPE_COMPACTION_RANGE_ABOVE_NEXT = 9;
+    ANOMALY_TYPE_COMPACTION_TOMBSTONE_OVERLAP = 10;
+    ANOMALY_TYPE_COMPACTION_TOMBSTONE_OUTSIDE_CLEANED = 11;
+    ANOMALY_TYPE_TERM_ORDERING = 12;
+    ANOMALY_TYPE_COMPACTION_STATE_UNEXPECTED = 13;
+}
+
+// A single anomaly found during metastore validation.
+message MetastoreAnomaly {
+    // The type of anomaly.
+    AnomalyType anomaly_type = 1;
+    // Human-readable description of the anomaly.
+    string description = 2;
+}
+
+// ListCloudTopicsRequest lists cloud topics from the cluster's topic table
+// (not the metastore). Hosted here for convenience since the metastore
+// admin service already has topic_table access.
+message ListCloudTopicsRequest {
+    // Optional: resume listing after this topic name (exclusive).
+    // Omit to start from the beginning.
+    string after_topic_name = 1;
+    // Maximum number of topics to return. 0 uses a default of 100.
+    uint32 max_topics = 2;
+}
+
+// ListCloudTopicsResponse contains cloud topics with their metadata.
+message ListCloudTopicsResponse {
+    repeated CloudTopicInfo topics = 1;
+    // If true, more topics are available. Call again with after_topic_name
+    // set to the last topic's name to continue.
+    bool has_more = 2;
+}
+
+// Information about a single cloud topic.
+message CloudTopicInfo {
+    // The Kafka topic name.
+    string topic_name = 1;
+    // The topic UUID.
+    string topic_id = 2;
+    // Number of partitions.
+    int32 partition_count = 3;
+}

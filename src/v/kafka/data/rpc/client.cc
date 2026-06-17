@@ -1,0 +1,668 @@
+/*
+ * Copyright 2024 Redpanda Data, Inc.
+ *
+ * Use of this software is governed by the Business Source License
+ * included in the file licenses/BSL.md
+ *
+ * As of the Change Date specified in that file, in accordance with
+ * the Business Source License, use of this software will be governed
+ * by the Apache License, Version 2.0
+ */
+
+#include "kafka/data/rpc/client.h"
+
+#include "kafka/data/rpc/rpc_service.h"
+#include "logger.h"
+#include "random/simple_time_jitter.h"
+#include "rpc/connection_cache.h"
+#include "ssx/async_algorithm.h"
+#include "utils/backoff_policy.h"
+
+#include <seastar/core/abort_source.hh>
+#include <seastar/core/future.hh>
+#include <seastar/core/lowres_clock.hh>
+#include <seastar/core/sleep.hh>
+#include <seastar/coroutine/as_future.hh>
+
+#include <chrono>
+
+namespace kafka::data::rpc {
+
+namespace {
+constexpr auto timeout = std::chrono::seconds(1);
+constexpr int max_client_retries = 5;
+constexpr auto base_backoff_duration = 100ms;
+constexpr auto max_backoff_duration = base_backoff_duration
+                                      * max_client_retries;
+/// Per-attempt sleep applied on not_leader mitigations: gives enough time
+/// to propagate a new leader between attempts. Sized so 4 mitigations stay
+/// safely under typical RPC caller deadlines (e.g. SR's 10s HTTP timeout).
+constexpr auto mitigation_interval = std::chrono::seconds(2);
+constexpr auto mitigation_jitter = 500ms;
+
+template<typename T>
+concept ResponseWithErrorCode = requires(T resp) {
+    { resp.ec } -> std::same_as<cluster::errc&>;
+};
+
+/// Extracts the cluster::errc from a response of any supported type.
+template<typename T>
+cluster::errc extract_errc(const T& r) {
+    if constexpr (std::is_same_v<cluster::errc, T>) {
+        return r;
+    } else if constexpr (outcome::is_basic_result_v<T>) {
+        return r.has_error() ? r.error() : cluster::errc::success;
+    } else if constexpr (ResponseWithErrorCode<T>) {
+        return r.ec;
+    } else {
+        static_assert(
+          base::unsupported_type<T>::value, "unsupported response type");
+    }
+}
+
+/// Policy for retry_with_backoff: controls what happens before each attempt
+/// (prepare_for_request) and how retriable errors are mitigated between
+/// retries.
+template<typename T>
+concept RetryPolicy = requires(T ctx, cluster::errc ec) {
+    { ctx.prepare_for_request() } -> std::same_as<void>;
+    { ctx.handle_error(ec) } -> std::same_as<ss::future<>>;
+    { ctx.as() } -> std::same_as<ss::abort_source&>;
+};
+
+/// Default policy: blind exponential backoff on retriable errors.
+struct backoff_retry_policy {
+    ss::abort_source& _as;
+    backoff_policy _backoff = make_exponential_backoff_policy<ss::lowres_clock>(
+      base_backoff_duration, max_backoff_duration);
+
+    explicit backoff_retry_policy(ss::abort_source& as)
+      : _as(as) {}
+
+    void prepare_for_request() {}
+
+    ss::future<> handle_error(cluster::errc) {
+        auto dur = _backoff.current_backoff_duration();
+        _backoff.next_backoff();
+        return ss::sleep_abortable<ss::lowres_clock>(dur, _as);
+    }
+
+    ss::abort_source& as() { return _as; }
+};
+
+/// Retry policy for callers that need to ride out leadership churn (e.g.
+/// schema registry RPCs). Behaves like backoff_retry_policy on transient
+/// errors, but additionally sleeps a jittered interval on not_leader so
+/// leadership has time to stabilize before the next attempt — without
+/// burning through the retry budget faster than the local leader cache
+/// gets refreshed.
+struct leader_mitigating_retry_policy {
+    ss::abort_source& _as;
+    backoff_policy _backoff = make_exponential_backoff_policy<ss::lowres_clock>(
+      base_backoff_duration, max_backoff_duration);
+    simple_time_jitter<ss::lowres_clock> _interval{
+      mitigation_interval, mitigation_jitter};
+
+    explicit leader_mitigating_retry_policy(ss::abort_source& as)
+      : _as(as) {}
+
+    void prepare_for_request() {}
+
+    ss::future<> handle_error(cluster::errc ec) {
+        auto dur = _backoff.current_backoff_duration();
+        _backoff.next_backoff();
+        co_await ss::sleep_abortable<ss::lowres_clock>(dur, _as);
+        if (ec == cluster::errc::not_leader) {
+            co_await ss::sleep_abortable<ss::lowres_clock>(
+              _interval.next_duration(), _as);
+        }
+    }
+
+    ss::abort_source& as() { return _as; }
+};
+
+template<typename Func, RetryPolicy Policy>
+std::invoke_result_t<Func> retry_with_backoff(Func func, Policy policy) {
+    int attempts = 0;
+    while (true) {
+        ++attempts;
+        policy.prepare_for_request();
+        using result_type
+          = ss::futurize<typename std::invoke_result_t<Func>>::value_type;
+        auto fut = co_await ss::coroutine::as_future<result_type>(
+          ss::futurize_invoke(func));
+        if (fut.failed()) {
+            if (attempts >= max_client_retries) {
+                co_return co_await std::move(fut);
+            }
+            auto ex = fut.get_exception();
+            vlog(log.debug, "Retrying after error: {}", ex);
+            co_await policy.handle_error(cluster::errc::timeout);
+            continue;
+        }
+        result_type r = fut.get();
+        auto ec = extract_errc(r);
+        switch (ec) {
+        case cluster::errc::not_leader:
+        case cluster::errc::timeout:
+        case cluster::errc::partition_operation_failed:
+            if (attempts >= max_client_retries) {
+                co_return r;
+            }
+            co_await policy.handle_error(ec);
+            break;
+        case cluster::errc::success:
+        default:
+            co_return r;
+        }
+    }
+    __builtin_unreachable();
+}
+
+cluster::errc map_errc(std::error_code ec) {
+    if (ec.category() == cluster::error_category()) {
+        return static_cast<cluster::errc>(ec.value());
+    } else if (ec.category() == raft::error_category()) {
+        auto raft_ec = static_cast<raft::errc>(ec.value());
+        switch (raft_ec) {
+        case raft::errc::not_leader:
+        case raft::errc::leadership_transfer_in_progress:
+            return cluster::errc::not_leader;
+        default:
+            vlog(
+              log.error,
+              "unexpected transform produce raft error: {}",
+              ::rpc::error_category().message(int(raft_ec)));
+            break;
+        }
+    } else if (ec.category() == ::rpc::error_category()) {
+        auto rpc_ec = static_cast<::rpc::errc>(ec.value());
+        switch (rpc_ec) {
+        case ::rpc::errc::client_request_timeout:
+        case ::rpc::errc::connection_timeout:
+        case ::rpc::errc::disconnected_endpoint:
+        case ::rpc::errc::exponential_backoff:
+        case ::rpc::errc::shutting_down:
+        case ::rpc::errc::service_unavailable:
+            return cluster::errc::timeout;
+        default:
+            vlog(
+              log.error,
+              "kafka data produce rpc error: {}",
+              ::rpc::error_category().message(int(rpc_ec)));
+            break;
+        }
+    } else {
+        vlog(log.error, "unexpected kafka data produce error: {}", ec);
+    }
+    return cluster::errc::timeout;
+}
+} // namespace
+
+client::client(
+  model::node_id self,
+  std::unique_ptr<kafka::data::rpc::partition_leader_cache> l,
+  std::unique_ptr<kafka::data::rpc::topic_creator> t,
+  std::unique_ptr<kafka::data::rpc::topic_metadata_cache> mdc,
+  ss::sharded<::rpc::connection_cache>* c,
+  ss::sharded<local_service>* s)
+  : _self(self)
+  , _leaders(std::move(l))
+  , _topic_creator(std::move(t))
+  , _metadata_cache(std::move(mdc))
+  , _connections(c)
+  , _local_service(s) {}
+
+template<typename Func>
+std::invoke_result_t<Func> client::retry(Func&& func) {
+    auto holder = _gate.hold();
+    co_return co_await retry_with_backoff(
+      std::forward<Func>(func), backoff_retry_policy{_as});
+}
+
+template<typename Func>
+std::invoke_result_t<Func> client::retry_with_leader_mitigation(Func&& func) {
+    auto holder = _gate.hold();
+    co_return co_await retry_with_backoff(
+      std::forward<Func>(func), leader_mitigating_retry_policy{_as});
+}
+
+ss::future<cluster::errc> client::produce(
+  model::topic_partition tp, ss::chunked_fifo<model::record_batch> batches) {
+    if (batches.empty()) {
+        co_return cluster::errc::success;
+    }
+    produce_request req;
+    req.topic_data.emplace_back(std::move(tp), std::move(batches));
+    req.timeout = timeout;
+    co_return (
+      co_await retry([this, &req]() { return do_produce_once(req.share()); }))
+      .ec;
+}
+
+ss::future<cluster::errc>
+client::produce(model::topic_partition tp, model::record_batch batch) {
+    produce_request req;
+    req.topic_data.emplace_back(std::move(tp), std::move(batch));
+    req.timeout = timeout;
+    co_return (
+      co_await retry([this, &req]() { return do_produce_once(req.share()); }))
+      .ec;
+}
+
+ss::future<produce_result> client::produce_with_leader_mitigation(
+  model::topic_partition tp, model::record_batch b) {
+    produce_request req;
+    req.topic_data.emplace_back(std::move(tp), std::move(b));
+    req.timeout = timeout;
+    co_return co_await retry_with_leader_mitigation(
+      [this, &req]() { return do_produce_once(req.share()); });
+}
+
+ss::future<produce_result> client::do_produce_once(produce_request req) {
+    vassert(
+      req.topic_data.size() == 1,
+      "expected a single batch: {}",
+      req.topic_data.size());
+    model::ktp ktp{
+      req.topic_data.front().tp.topic, req.topic_data.front().tp.partition};
+    auto leader = _leaders->get_leader_node(
+      ktp.as_tn_view(), ktp.get_partition());
+    if (!leader) {
+        co_return produce_result{.ec = cluster::errc::not_leader};
+    }
+    vlog(log.trace, "do_produce_once_request(node={}): {}", *leader, req);
+    auto reply = co_await (
+      *leader == _self ? do_local_produce(std::move(req))
+                       : do_remote_produce(*leader, std::move(req)));
+    vlog(log.trace, "do_produce_once_reply(node={}): {}", *leader, reply);
+    vassert(
+      reply.results.size() == 1,
+      "expected a single result: {}",
+      reply.results.size());
+    const auto& front = reply.results.front();
+    co_return produce_result{
+      .ec = front.err,
+      .base_offset = front.base_offset,
+      .last_offset = front.last_offset};
+}
+
+ss::future<cluster::errc> client::create_topic(
+  model::topic_namespace_view tp,
+  cluster::topic_properties props,
+  std::optional<int32_t> partition_count,
+  std::optional<int16_t> replication_factor) {
+    co_return co_await retry(
+      [this, tp, partition_count, replication_factor, p = std::move(props)]() {
+          return try_create_topic(tp, p, partition_count, replication_factor);
+      });
+}
+
+ss::future<cluster::errc> client::try_create_topic(
+  model::topic_namespace_view nt,
+  cluster::topic_properties props,
+  std::optional<int32_t> partition_count,
+  std::optional<int16_t> replication_factor) {
+    auto fut = co_await ss::coroutine::as_future<cluster::errc>(
+      _topic_creator->create_topic(
+        nt,
+        partition_count.value_or(
+          config::shard_local_cfg().default_topic_partitions()),
+        std::move(props),
+        replication_factor));
+    if (fut.failed()) {
+        throw std::runtime_error(
+          fmt::format(
+            "Error creating topic '{}': {}", nt, fut.get_exception()));
+    }
+    auto ec = fut.get();
+    if (
+      ec != cluster::errc::success
+      && ec != cluster::errc::topic_already_exists) {
+        throw std::runtime_error(
+          fmt::format("Failed to create topic '{}'", nt));
+    }
+    co_return ec;
+}
+
+ss::future<cluster::errc>
+client::update_topic(cluster::topic_properties_update update) {
+    return _topic_creator->update_topic(std::move(update));
+}
+
+ss::future<> client::start() { return ss::now(); }
+
+ss::future<> client::stop() {
+    _as.request_abort();
+    co_await _gate.close();
+}
+
+ss::future<produce_reply> client::do_local_produce(produce_request req) {
+    auto r = co_await _local_service->local().produce(
+      std::move(req.topic_data), req.timeout);
+    co_return produce_reply(std::move(r));
+}
+
+ss::future<produce_reply>
+client::do_remote_produce(model::node_id node, produce_request req) {
+    auto resp = co_await _connections->local()
+                  .with_node_client<
+                    kafka::data::rpc::impl::kafka_data_rpc_client_protocol>(
+                    _self,
+                    ss::this_shard_id(),
+                    node,
+                    timeout,
+                    [req = req.share()](
+                      impl::kafka_data_rpc_client_protocol proto) mutable {
+                        return proto.produce(
+                          std::move(req),
+                          ::rpc::client_opts(
+                            model::timeout_clock::now() + timeout));
+                    })
+                  .then(&::rpc::get_ctx_data<produce_reply>);
+    if (resp.has_error()) {
+        cluster::errc ec = map_errc(resp.assume_error());
+        produce_reply reply;
+        for (const auto& data : req.topic_data) {
+            reply.results.emplace_back(data.tp, ec);
+        }
+        co_return reply;
+    }
+    co_return std::move(resp).value();
+}
+
+namespace {
+chunked_vector<topic_partitions> topic_partition_map_to_vector(
+  chunked_hash_map<model::topic, chunked_vector<model::partition_id>> map) {
+    chunked_vector<topic_partitions> result;
+    result.reserve(map.size());
+    for (auto& [topic, partitions] : map) {
+        topic_partitions tp;
+        tp.topic = std::move(topic);
+        tp.partitions = std::move(partitions);
+        result.push_back(std::move(tp));
+    }
+    return result;
+}
+
+void join_maps(
+  partition_offsets_map& aggregate, partition_offsets_map&& element) {
+    for (auto& [topic, partitions] : element) {
+        auto& aggregate_partitions = aggregate[topic];
+        for (auto& [partition, offsets] : partitions) {
+            aggregate_partitions[partition] = std::move(offsets);
+        }
+    }
+}
+
+chunked_vector<topic_partitions>
+copy(const chunked_vector<topic_partitions>& vec) {
+    chunked_vector<topic_partitions> result;
+    result.reserve(vec.size());
+    for (const auto& item : vec) {
+        result.push_back(
+          topic_partitions{
+            .topic = item.topic,
+            .partitions = item.partitions.copy(),
+          });
+    }
+    return result;
+}
+
+partition_offsets_map make_error_results(
+  const chunked_vector<topic_partitions>& topic_partitions,
+  cluster::errc error) {
+    partition_offsets_map results;
+    results.reserve(topic_partitions.size());
+    for (auto& topic : topic_partitions) {
+        results[topic.topic].reserve(topic.partitions.size());
+        for (auto& partition : topic.partitions) {
+            results[topic.topic][partition] = partition_offset_result(error);
+        }
+    }
+    return results;
+}
+} // namespace
+
+ss::future<result<partition_offsets_map, cluster::errc>>
+client::get_partition_offsets(
+  chunked_vector<topic_partitions> topic_partitions) {
+    partition_offsets_map results;
+    ssx::async_counter cnt;
+    chunked_hash_map<
+      model::node_id,
+      chunked_hash_map<model::topic, chunked_vector<model::partition_id>>>
+      per_node_partitions;
+
+    for (auto& topic : topic_partitions) {
+        co_await ssx::async_for_each_counter(
+          cnt,
+          topic.partitions,
+          [this, &topic, &per_node_partitions, &results](
+            model::partition_id partition) {
+              model::topic_namespace_view tp_ns(
+                model::kafka_namespace, topic.topic);
+              auto tp_cfg = _metadata_cache->find_topic_cfg(tp_ns);
+              if (!tp_cfg) {
+                  results[topic.topic][partition] = partition_offset_result(
+                    cluster::errc::topic_not_exists);
+                  return;
+              }
+              auto leader = _leaders->get_leader_node(
+                model::topic_namespace_view(
+                  model::kafka_namespace, topic.topic),
+                partition);
+              if (!leader) {
+                  results[topic.topic][partition] = partition_offset_result(
+                    cluster::errc::not_leader);
+              } else {
+                  per_node_partitions[*leader][topic.topic].push_back(
+                    partition);
+              }
+          });
+    }
+    co_await ss::parallel_for_each(
+      per_node_partitions, [this, &results](auto& pair) {
+          if (pair.first == _self) {
+              // If the leader is this node, we can use the local service
+              return _local_service->local()
+                .get_offsets(
+                  topic_partition_map_to_vector(std::move(pair.second)))
+                .then([&results](partition_offsets_map local_results) {
+                    join_maps(results, std::move(local_results));
+                });
+          }
+          auto topic_partitions = topic_partition_map_to_vector(
+            std::move(pair.second));
+          return get_remote_partition_offsets(
+                   pair.first, copy(topic_partitions))
+            .then([leader_id = pair.first,
+                   topic_partitions = std::move(topic_partitions)](
+                    result<partition_offsets_map, cluster::errc> res) {
+                if (res.has_error()) {
+                    vlog(
+                      log.warn,
+                      "Failed to get partition offsets from node {}: {}",
+                      leader_id,
+                      res.error());
+                    return make_error_results(topic_partitions, res.error());
+                }
+                return std::move(res.value());
+            })
+            .then([&results](partition_offsets_map remote_results) {
+                join_maps(results, std::move(remote_results));
+            });
+      });
+    co_return results;
+}
+
+ss::future<result<partition_offsets_map, cluster::errc>>
+client::get_remote_partition_offsets(
+  model::node_id leader, chunked_vector<topic_partitions> topics) {
+    using ret_t = result<partition_offsets_map, cluster::errc>;
+    auto result
+      = co_await _connections->local()
+          .with_node_client<
+            kafka::data::rpc::impl::kafka_data_rpc_client_protocol>(
+            _self,
+            ss::this_shard_id(),
+            leader,
+            timeout,
+            [topics = std::move(topics)](
+              impl::kafka_data_rpc_client_protocol proto) mutable {
+                return proto.get_offsets(
+                  get_offsets_request(std::move(topics)),
+                  ::rpc::client_opts(model::timeout_clock::now() + timeout));
+            })
+          .then([](auto ctx) {
+              return ::rpc::get_ctx_data<get_offsets_reply>(std::move(ctx));
+          });
+
+    if (result.has_error()) {
+        co_return ret_t(map_errc(result.assume_error()));
+    }
+    co_return ret_t(std::move(result.value().partition_offsets));
+}
+
+ss::future<result<partition_offsets, cluster::errc>>
+client::get_single_partition_offsets(model::topic_partition tp) {
+    co_return co_await retry_with_leader_mitigation(
+      [this, tp]() { return do_get_single_partition_offsets_once(tp); });
+}
+
+ss::future<result<partition_offsets, cluster::errc>>
+client::do_get_single_partition_offsets_once(model::topic_partition tp) {
+    using ret_t = result<partition_offsets, cluster::errc>;
+    model::topic_namespace_view tp_ns(model::kafka_namespace, tp.topic);
+
+    auto topic_cfg = _metadata_cache->find_topic_cfg(tp_ns);
+    if (!topic_cfg) {
+        co_return ret_t(cluster::errc::topic_not_exists);
+    }
+
+    auto leader = _leaders->get_leader_node(tp_ns, tp.partition);
+    if (!leader) {
+        co_return ret_t(cluster::errc::not_leader);
+    }
+
+    // Build the single-partition request in the same wire format the
+    // existing get_offsets RPC expects.
+    chunked_vector<topic_partitions> topics;
+    topic_partitions tps;
+    tps.topic = tp.topic;
+    tps.partitions.push_back(tp.partition);
+    topics.push_back(std::move(tps));
+
+    partition_offsets_map offsets_map;
+    if (*leader == _self) {
+        offsets_map = co_await _local_service->local().get_offsets(
+          std::move(topics));
+    } else {
+        auto remote_result = co_await get_remote_partition_offsets(
+          *leader, std::move(topics));
+        if (remote_result.has_error()) {
+            co_return ret_t(remote_result.error());
+        }
+        offsets_map = std::move(remote_result.value());
+    }
+
+    // Extract the single result.
+    auto topic_it = offsets_map.find(tp.topic);
+    if (topic_it == offsets_map.end()) {
+        co_return ret_t(cluster::errc::not_leader);
+    }
+    auto part_it = topic_it->second.find(tp.partition);
+    if (part_it == topic_it->second.end()) {
+        co_return ret_t(cluster::errc::not_leader);
+    }
+    auto& por = part_it->second;
+    if (por.err != cluster::errc::success) {
+        co_return ret_t(por.err);
+    }
+    co_return ret_t(por.offsets);
+}
+
+ss::future<result<consume_reply, cluster::errc>> client::consume(
+  model::topic_partition tp,
+  kafka::offset start_offset,
+  kafka::offset max_offset,
+  size_t min_bytes,
+  size_t max_bytes,
+  model::timeout_clock::duration timeout) {
+    co_return co_await retry_with_leader_mitigation(
+      [this, tp, start_offset, max_offset, min_bytes, max_bytes, timeout]() {
+          return do_consume_once(
+            tp, start_offset, max_offset, min_bytes, max_bytes, timeout);
+      });
+}
+
+ss::future<result<consume_reply, cluster::errc>> client::do_consume_once(
+  model::topic_partition tp,
+  kafka::offset start_offset,
+  kafka::offset max_offset,
+  size_t min_bytes,
+  size_t max_bytes,
+  model::timeout_clock::duration timeout) {
+    using ret_t = result<consume_reply, cluster::errc>;
+    model::topic_namespace_view tp_ns(model::kafka_namespace, tp.topic);
+
+    auto topic_cfg = _metadata_cache->find_topic_cfg(tp_ns);
+    if (!topic_cfg) {
+        consume_reply reply;
+        reply.tp = tp;
+        reply.err = cluster::errc::topic_not_exists;
+        co_return ret_t(std::move(reply));
+    }
+
+    auto leader = _leaders->get_leader_node(tp_ns, tp.partition);
+    if (!leader) {
+        co_return ret_t(cluster::errc::not_leader);
+    }
+
+    consume_request req(
+      tp, start_offset, max_offset, min_bytes, max_bytes, timeout);
+
+    auto is_retriable = [](cluster::errc ec) -> bool {
+        return ec == cluster::errc::not_leader || ec == cluster::errc::timeout
+               || ec == cluster::errc::partition_operation_failed;
+    };
+
+    // If leader is local, call local service
+    if (*leader == _self) {
+        auto reply = co_await _local_service->local().consume(std::move(req));
+        if (is_retriable(reply.err)) {
+            co_return ret_t(reply.err);
+        }
+        co_return ret_t(std::move(reply));
+    }
+
+    // Otherwise call remote service
+    auto result
+      = co_await _connections->local()
+          .with_node_client<
+            kafka::data::rpc::impl::kafka_data_rpc_client_protocol>(
+            _self,
+            ss::this_shard_id(),
+            *leader,
+            timeout,
+            [req = std::move(req),
+             timeout](impl::kafka_data_rpc_client_protocol proto) mutable {
+                return proto.consume(
+                  std::move(req),
+                  ::rpc::client_opts(model::timeout_clock::now() + timeout));
+            })
+          .then([](auto ctx) {
+              return ::rpc::get_ctx_data<consume_reply>(std::move(ctx));
+          });
+
+    if (result.has_error()) {
+        co_return ret_t(map_errc(result.assume_error()));
+    }
+
+    auto reply = std::move(result).value();
+    if (is_retriable(reply.err)) {
+        co_return ret_t(reply.err);
+    }
+    co_return ret_t(std::move(reply));
+}
+} // namespace kafka::data::rpc

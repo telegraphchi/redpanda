@@ -1,0 +1,37 @@
+/*
+ * Copyright 2021 Redpanda Data, Inc.
+ *
+ * Use of this software is governed by the Business Source License
+ * included in the file licenses/BSL.md
+ *
+ * As of the Change Date specified in that file, in accordance with
+ * the Business Source License, use of this software will be governed
+ * by the Apache License, Version 2.0
+ */
+
+#pragma once
+
+#include "pandaproxy/schema_registry/errors.h"
+#include "pandaproxy/schema_registry/fwd.h"
+#include "pandaproxy/schema_registry/types.h"
+
+namespace pandaproxy::schema_registry {
+
+ss::future<avro_schema_definition>
+make_avro_schema_definition(schema_getter& store, subject_schema schema);
+
+result<schema_definition>
+sanitize_avro_schema_definition(schema_definition def);
+
+ss::future<subject_schema> make_canonical_avro_schema(
+  schema_getter& store, subject_schema schema, normalize norm = normalize::no);
+
+ss::future<schema_definition> format_avro_schema_definition(
+  schema_getter& store, schema_definition schema, output_format format);
+
+compatibility_result check_compatible(
+  const avro_schema_definition& reader,
+  const avro_schema_definition& writer,
+  verbose is_verbose = verbose::no);
+
+} // namespace pandaproxy::schema_registry

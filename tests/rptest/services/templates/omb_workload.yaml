@@ -1,0 +1,30 @@
+name: {{name}}
+
+{% if existing_topic_list is defined %}
+existingTopicList: {{existing_topic_list}}
+{% endif %}
+topics: {{topics}}
+partitionsPerTopic: {{partitions_per_topic}}
+{% if key_distributor is defined %}
+keyDistributor: {{key_distributor}}
+{% endif %}
+{% if message_size is defined %}
+messageSize: {{message_size}}
+{% if use_randomized_payloads is defined %}
+useRandomizedPayloads: {{use_randomized_payloads}}
+randomBytesRatio: {{random_bytes_ratio}}
+randomizedPayloadPoolSize: {{randomized_payload_pool_size}}
+{% else %}
+payloadFile: {{payload_file}}
+{% endif %}
+{% else %}
+messageSize: 1024
+payloadFile: "payload/payload-1Kb.data"
+{% endif %}
+subscriptionsPerTopic: {{subscriptions_per_topic}}
+producersPerTopic: {{producers_per_topic}}
+consumerPerSubscription: {{consumer_per_subscription}}
+producerRate: {{producer_rate}}
+consumerBacklogSizeGB: {{consumer_backlog_size_GB}}
+testDurationMinutes: {{test_duration_minutes}}
+warmupDurationMinutes: {{warmup_duration_minutes}}

@@ -1,0 +1,85 @@
+/*
+ * Copyright 2020 Redpanda Data, Inc.
+ *
+ * Use of this software is governed by the Business Source License
+ * included in the file licenses/BSL.md
+ *
+ * As of the Change Date specified in that file, in accordance with
+ * the Business Source License, use of this software will be governed
+ * by the Apache License, Version 2.0
+ */
+
+#pragma once
+
+#include "base/format_to.h"
+#include "bytes/iobuf.h"
+#include "kafka/protocol/kafka_batch_adapter.h"
+#include "model/fundamental.h"
+
+#include <optional>
+
+namespace kafka {
+
+///\brief batch_reader owns an iobuf that's a concatenation of
+/// model::record_batch on the wire
+///
+/// The array bound is not serialized, c.f. array<kafka::thing>
+class batch_reader final : public model::record_batch_reader::impl {
+    using storage_t = model::record_batch_reader::storage_t;
+
+public:
+    /**
+     * Kafka brokers may return partial batch in fetch responses. This is to
+     * optimize the maintenance of fetch max bytes. The partial batch is always
+     * the last batch in the fetch response. This flag allows the caller to
+     * indicate that it is ok to ignore the partial batch and stop read earlier.
+     */
+    using tolerate_partial_last_batch
+      = ss::bool_class<struct tolerate_partial_last_batch_tag>;
+
+    batch_reader() = default;
+
+    explicit batch_reader(
+      iobuf buf,
+      tolerate_partial_last_batch tolerate_partial
+      = tolerate_partial_last_batch::no)
+      : _buf(std::move(buf))
+      , _tolerate_partial(tolerate_partial) {}
+
+    bool empty() const { return _buf.empty(); }
+
+    size_t size_bytes() const { return _buf.size_bytes(); }
+
+    // Obtain the offset of the last record in the last batch
+    //
+    // Complexity: O(n) record_batches
+    model::offset last_offset() const;
+
+    // Consume a model::record_batch as a kafka_batch_adaptor
+    kafka_batch_adapter consume_batch();
+
+    // Implements model::record_batch_reader::impl
+    bool is_end_of_stream() const final {
+        return _do_load_slice_failed || empty();
+    }
+
+    // Implements model::record_batch_reader::impl
+    ss::future<storage_t> do_load_slice(model::timeout_clock::time_point) final;
+
+    // Implements model::record_batch_reader::impl
+    // NOTE: this stream is intentionally devoid of user data.
+    fmt::iterator format_to(fmt::iterator it) const final {
+        return fmt::format_to(it, "{{size {}}}", size_bytes());
+    }
+
+    // Release any remaining iobuf that hasn't been consumed
+    iobuf release() && { return std::move(_buf); }
+
+private:
+    iobuf _buf;
+    bool _do_load_slice_failed{false};
+    tolerate_partial_last_batch _tolerate_partial{
+      tolerate_partial_last_batch::no};
+};
+
+} // namespace kafka

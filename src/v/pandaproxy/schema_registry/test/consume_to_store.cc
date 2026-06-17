@@ -1,0 +1,562 @@
+// Copyright 2021 Redpanda Data, Inc.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.md
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0
+
+// Copyright 2020 Redpanda Data, Inc.
+//
+// Use of this software is governed by the Business Source License
+// included in the file licenses/BSL.md
+//
+// As of the Change Date specified in that file, in accordance with
+// the Business Source License, use of this software will be governed
+// by the Apache License, Version 2.0
+
+#include "bytes/iobuf_parser.h"
+#include "model/fundamental.h"
+#include "model/record.h"
+#include "pandaproxy/schema_registry/avro.h"
+#include "pandaproxy/schema_registry/seq_writer.h"
+#include "pandaproxy/schema_registry/sharded_store.h"
+#include "pandaproxy/schema_registry/storage.h"
+#include "pandaproxy/schema_registry/test/utils.h"
+
+#include <seastar/testing/thread_test_case.hh>
+#include <seastar/util/defer.hh>
+
+#include <boost/test/tools/old/interface.hpp>
+#include <boost/test/unit_test.hpp>
+
+namespace pps = pandaproxy::schema_registry;
+
+const auto subject0 = pps::context_subject::unqualified("subject0");
+constexpr pps::topic_key_magic magic0{0};
+constexpr pps::topic_key_magic magic1{1};
+constexpr pps::topic_key_magic magic2{2};
+constexpr pps::schema_version version0{0};
+constexpr pps::schema_version version1{1};
+constexpr pps::schema_id id0{0};
+constexpr pps::schema_id id1{1};
+
+const pps::schema_definition string_def0{
+  pps::sanitize_avro_schema_definition(
+    {R"({"type":"string"})",
+     pps::schema_type::avro,
+     {{.name{"ref"}, .sub{subject0}, .version{version0}}},
+     {}})
+    .value()};
+const pps::schema_definition int_def0{
+  pps::sanitize_avro_schema_definition(
+    {R"({"type": "int"})", pps::schema_type::avro})
+    .value()};
+
+inline model::record_batch make_delete_subject_batch(pps::context_subject sub) {
+    storage::record_batch_builder rb{
+      model::record_batch_type::raft_data, model::offset{0}};
+
+    rb.add_raw_kv(
+      to_json_iobuf(
+        pps::delete_subject_key{
+          .seq{model::offset{0}}, .node{model::node_id{0}}, .sub{sub}}),
+      to_json_iobuf(pps::delete_subject_value{.sub{sub}}));
+    return std::move(rb).build();
+}
+
+inline model::record_batch make_delete_subject_permanently_batch(
+  pps::context_subject sub,
+  const chunked_vector<pps::schema_version>& versions) {
+    storage::record_batch_builder rb{
+      model::record_batch_type::raft_data, model::offset{0}};
+
+    std::for_each(versions.cbegin(), versions.cend(), [&](auto version) {
+        rb.add_raw_kv(
+          to_json_iobuf(
+            pps::schema_key{
+              .seq{model::offset{0}},
+              .node{model::node_id{0}},
+              .sub{sub},
+              .version{version}}),
+          std::nullopt);
+    });
+    return std::move(rb).build();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_consume_to_store) {
+    pps::sharded_store s;
+    s.start(pps::is_mutable::yes, ss::default_smp_service_group()).get();
+    auto stop_store = ss::defer([&s]() { s.stop().get(); });
+
+    // This transport will not be used by the sequencer
+    // (which itself is only instantiated to receive consume_to_store's
+    //  offset updates), is just needed for constructor.
+    noop_transport dummy_transport;
+
+    ss::sharded<pps::seq_writer> seq;
+    seq
+      .start(
+        model::node_id{0},
+        ss::default_smp_service_group(),
+        std::ref(dummy_transport),
+        std::reference_wrapper(s),
+        ss::sharded_parameter(
+          [] { return std::make_unique<sequence_state_checker_test>(); }))
+      .get();
+    auto stop_seq = ss::defer([&seq]() { seq.stop().get(); });
+
+    auto c = pps::consume_to_store(s, seq.local());
+
+    auto sequence = model::offset{0};
+    const auto node_id = model::node_id{123};
+
+    auto good_schema_1 = pps::as_record_batch(
+      pps::schema_key{sequence, node_id, subject0, version0, magic1},
+      pps::schema_value{{subject0, string_def0.share()}, version0, id0});
+    BOOST_REQUIRE_NO_THROW(c(good_schema_1.copy()).get());
+
+    auto s_res = s.get_subject_schema(
+                    subject0, version0, pps::include_deleted::no)
+                   .get();
+    BOOST_REQUIRE_EQUAL(s_res.schema.def(), string_def0);
+
+    auto good_schema_ref_1 = pps::as_record_batch(
+      pps::schema_key{sequence, node_id, subject0, version1, magic1},
+      pps::schema_value{{subject0, string_def0.share()}, version1, id1});
+    BOOST_REQUIRE_NO_THROW(c(good_schema_ref_1.copy()).get());
+
+    auto s_ref_res = s.get_subject_schema(
+                        subject0, version1, pps::include_deleted::no)
+                       .get();
+    BOOST_REQUIRE_EQUAL(s_ref_res.schema.def(), string_def0);
+    BOOST_REQUIRE_EQUAL(s_ref_res.schema.sub(), subject0);
+    BOOST_REQUIRE_EQUAL(s_ref_res.id, id1);
+    BOOST_REQUIRE_EQUAL_COLLECTIONS(
+      s_ref_res.schema.def().refs().begin(),
+      s_ref_res.schema.def().refs().end(),
+      string_def0.refs().begin(),
+      string_def0.refs().end());
+
+    auto bad_schema_magic = pps::as_record_batch(
+      pps::schema_key{sequence, node_id, subject0, version0, magic2},
+      pps::schema_value{{subject0, string_def0.share()}, version0, id0});
+    BOOST_REQUIRE_THROW(c(bad_schema_magic.copy()).get(), pps::exception);
+
+    BOOST_REQUIRE(
+      s.get_compatibility(pps::default_context, pps::default_to_global::yes)
+        .get()
+      == pps::compatibility_level::backward);
+    BOOST_REQUIRE(
+      s.get_compatibility(subject0, pps::default_to_global::yes).get()
+      == pps::compatibility_level::backward);
+
+    auto good_config = pps::as_record_batch(
+      pps::config_key{sequence, node_id, subject0, magic0},
+      pps::config_value{pps::compatibility_level::full});
+    BOOST_REQUIRE_NO_THROW(c(good_config.copy()).get());
+
+    BOOST_REQUIRE(
+      s.get_compatibility(subject0, pps::default_to_global::yes).get()
+      == pps::compatibility_level::full);
+
+    auto bad_config_magic = pps::as_record_batch(
+      pps::config_key{sequence, node_id, subject0, magic1},
+      pps::config_value{pps::compatibility_level::full});
+    BOOST_REQUIRE_THROW(c(bad_config_magic.copy()).get(), pps::exception);
+
+    // Test soft delete
+    BOOST_REQUIRE_EQUAL(
+      s.get_subjects(pps::include_deleted::no).get().size(), 1);
+    BOOST_REQUIRE_EQUAL(
+      s.get_subjects(pps::include_deleted::yes).get().size(), 1);
+    auto delete_sub = make_delete_subject_batch(subject0);
+    BOOST_REQUIRE_NO_THROW(c(delete_sub.copy()).get());
+    BOOST_REQUIRE_EQUAL(
+      s.get_subjects(pps::include_deleted::no).get().size(), 0);
+    BOOST_REQUIRE_EQUAL(
+      s.get_subjects(pps::include_deleted::yes).get().size(), 1);
+
+    // Test permanent delete
+    auto v_res = s.get_versions(subject0, pps::include_deleted::yes).get();
+    BOOST_REQUIRE_EQUAL(v_res.size(), 2);
+    auto perm_delete_sub = make_delete_subject_permanently_batch(
+      subject0, v_res);
+    BOOST_REQUIRE_NO_THROW(c(perm_delete_sub.copy()).get());
+    // Perma-deleting all versions also deletes the subject
+    BOOST_REQUIRE_THROW(
+      s.get_versions(subject0, pps::include_deleted::yes).get(),
+      pps::exception);
+
+    // Expect subject is deleted
+    auto sub_res = s.get_subjects(pps::include_deleted::no).get();
+    BOOST_REQUIRE_EQUAL(sub_res.size(), 0);
+}
+
+template<typename Key>
+model::record_batch as_record_batch(Key key) {
+    storage::record_batch_builder rb{
+      model::record_batch_type::raft_data, model::offset{0}};
+    rb.add_raw_kv(to_json_iobuf(std::move(key)), std::nullopt);
+    return std::move(rb).build();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_consume_to_store_after_compaction) {
+    pps::sharded_store s;
+    s.start(pps::is_mutable::no, ss::default_smp_service_group()).get();
+    auto stop_store = ss::defer([&s]() { s.stop().get(); });
+
+    // This transport will not be used by the sequencer
+    // (which itself is only instantiated to receive consume_to_store's
+    //  offset updates), is just needed for constructor.
+    noop_transport dummy_transport;
+
+    ss::sharded<pps::seq_writer> seq;
+    seq
+      .start(
+        model::node_id{0},
+        ss::default_smp_service_group(),
+        std::ref(dummy_transport),
+        std::reference_wrapper(s),
+        ss::sharded_parameter(
+          [] { return std::make_unique<sequence_state_checker_test>(); }))
+      .get();
+    auto stop_seq = ss::defer([&seq]() { seq.stop().get(); });
+
+    auto c = pps::consume_to_store(s, seq.local());
+
+    auto sequence = model::offset{0};
+    const auto node_id = model::node_id{123};
+
+    // Insert the schema at seq 0
+    auto good_schema_1 = pps::as_record_batch(
+      pps::schema_key{sequence, node_id, subject0, version0, magic1},
+      pps::schema_value{{subject0, string_def0.share()}, version0, id0});
+    BOOST_REQUIRE_NO_THROW(c(good_schema_1.copy()).get());
+    // Roll the segment
+    // Soft delete the version (at seq 1)
+    // Perm delete the version (at seq 1)
+    // Compact that away, so we have a gap
+    // Restart
+    // Delete seq0, version 0, it now appears as not soft-deleted
+    auto perm_delete_schema_1 = as_record_batch(
+      pps::schema_key{sequence, node_id, subject0, version0, magic1});
+    BOOST_REQUIRE_NO_THROW(c(perm_delete_schema_1.copy()).get());
+
+    BOOST_REQUIRE_EXCEPTION(
+      s.get_versions(subject0, pps::include_deleted::yes).get(),
+      pps::exception,
+      [](pps::exception e) {
+          return e.code() == pps::error_code::subject_not_found;
+      });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_writes_disabled) {
+    pps::sharded_store s;
+    s.start(pps::is_mutable::no, ss::default_smp_service_group()).get();
+    auto stop_store = ss::defer([&s]() { s.stop().get(); });
+
+    // This transport will not be used by the sequencer
+    // (which itself is only instantiated to receive consume_to_store's
+    //  offset updates), is just needed for constructor.
+    noop_transport dummy_transport;
+
+    ss::sharded<pps::seq_writer> seq;
+    seq
+      .start(
+        model::node_id{0},
+        ss::default_smp_service_group(),
+        std::ref(dummy_transport),
+        std::reference_wrapper(s),
+        ss::sharded_parameter([] {
+            return std::make_unique<sequence_state_checker_test>(
+              pps::sequence_state_checker::writes_disabled_t::yes);
+        }))
+      .get();
+    auto stop_seq = ss::defer([&seq]() { seq.stop().get(); });
+
+    BOOST_REQUIRE_EXCEPTION(
+      seq.local()
+        .write_mode(
+          pps::context_subject{pps::default_context, pps::subject{""}},
+          pps::mode::read_only,
+          pps::force::no)
+        .get(),
+      pps::exception,
+      [](pps::exception e) {
+          return e.code() == pps::error_code::writes_disabled;
+      });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_sync_writes_allowed_while_client_blocked) {
+    pps::sharded_store s;
+    s.start(pps::is_mutable::yes, ss::default_smp_service_group()).get();
+    auto stop_store = ss::defer([&s]() { s.stop().get(); });
+
+    accepting_transport transport;
+
+    ss::sharded<pps::seq_writer> seq;
+    seq
+      .start(
+        model::node_id{0},
+        ss::default_smp_service_group(),
+        std::ref(transport),
+        std::reference_wrapper(s),
+        ss::sharded_parameter([] {
+            return std::make_unique<sequence_state_checker_test>(
+              pps::sequence_state_checker::writes_disabled_t::yes,
+              pps::sequence_state_checker::writes_disabled_t::no);
+        }))
+      .get();
+    auto stop_seq = ss::defer([&seq]() { seq.stop().get(); });
+
+    BOOST_REQUIRE_EXCEPTION(
+      seq.local()
+        .write_mode(
+          pps::context_subject{pps::default_context, pps::subject{""}},
+          pps::mode::read_only,
+          pps::force::no)
+        .get(),
+      pps::exception,
+      [](pps::exception e) {
+          return e.code() == pps::error_code::writes_disabled;
+      });
+    BOOST_REQUIRE(transport.produced.empty());
+
+    BOOST_REQUIRE(
+      seq.local()
+        .write_mode(
+          pps::context_subject{pps::default_context, pps::subject{""}},
+          pps::mode::read_only,
+          pps::force::no,
+          pps::write_source::schema_registry_sync)
+        .get());
+    BOOST_REQUIRE_EQUAL(transport.produced.size(), 1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_force_cannot_bypass_mode_mutability) {
+    pps::sharded_store s;
+    s.start(pps::is_mutable::no, ss::default_smp_service_group()).get();
+    auto stop_store = ss::defer([&s]() { s.stop().get(); });
+
+    accepting_transport transport;
+
+    ss::sharded<pps::seq_writer> seq;
+    seq
+      .start(
+        model::node_id{0},
+        ss::default_smp_service_group(),
+        std::ref(transport),
+        std::reference_wrapper(s),
+        ss::sharded_parameter(
+          [] { return std::make_unique<sequence_state_checker_test>(); }))
+      .get();
+    auto stop_seq = ss::defer([&seq]() { seq.stop().get(); });
+
+    BOOST_REQUIRE_EXCEPTION(
+      seq.local()
+        .write_mode(
+          pps::context_subject{pps::default_context, pps::subject{""}},
+          pps::mode::read_only,
+          pps::force::yes,
+          pps::write_source::client)
+        .get(),
+      pps::exception,
+      [](pps::exception e) {
+          return e.code()
+                 == pps::error_code::subject_version_operation_not_permitted;
+      });
+    BOOST_REQUIRE(transport.produced.empty());
+
+    BOOST_REQUIRE(
+      seq.local()
+        .write_mode(
+          pps::context_subject{pps::default_context, pps::subject{""}},
+          pps::mode::read_only,
+          pps::force::yes,
+          pps::write_source::schema_registry_sync)
+        .get());
+    BOOST_REQUIRE_EQUAL(transport.produced.size(), 1);
+
+    BOOST_REQUIRE_EXCEPTION(
+      seq.local()
+        .delete_mode(
+          pps::context_subject{pps::default_context, pps::subject{""}},
+          pps::write_source::client)
+        .get(),
+      pps::exception,
+      [](pps::exception e) {
+          return e.code()
+                 == pps::error_code::subject_version_operation_not_permitted;
+      });
+
+    BOOST_REQUIRE(
+      seq.local()
+        .delete_mode(
+          pps::context_subject{pps::default_context, pps::subject{""}},
+          pps::write_source::schema_registry_sync)
+        .get());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_sync_bypasses_read_only_mode) {
+    pps::sharded_store s;
+    s.start(pps::is_mutable::yes, ss::default_smp_service_group()).get();
+    auto stop_store = ss::defer([&s]() { s.stop().get(); });
+
+    accepting_transport transport;
+
+    ss::sharded<pps::seq_writer> seq;
+    seq
+      .start(
+        model::node_id{0},
+        ss::default_smp_service_group(),
+        std::ref(transport),
+        std::reference_wrapper(s),
+        ss::sharded_parameter(
+          [] { return std::make_unique<sequence_state_checker_test>(); }))
+      .get();
+    auto stop_seq = ss::defer([&seq]() { seq.stop().get(); });
+
+    auto global = pps::context_subject{pps::default_context, pps::subject{""}};
+    BOOST_REQUIRE(seq.local()
+                    .write_mode(global, pps::mode::read_only, pps::force::no)
+                    .get());
+    auto subject1 = pps::context_subject::unqualified("subject1");
+    for (const auto& sub : {subject0, subject1}) {
+        seq.local()
+          .write_subject_version_imported(
+            pps::stored_schema{
+              .schema = {sub, int_def0.share()},
+              .version = version1,
+              .id = id1,
+              .deleted = pps::is_deleted::no})
+          .get();
+    }
+
+    auto require_readonly = [](auto fut) {
+        BOOST_REQUIRE_EXCEPTION(
+          fut.get(), pps::exception, [](pps::exception e) {
+              return e.code()
+                     == pps::error_code::
+                       subject_version_operation_not_permitted;
+          });
+    };
+
+    require_readonly(seq.local().write_config(
+      global, pps::compatibility_level::full, pps::write_source::client));
+    BOOST_REQUIRE(seq.local()
+                    .write_config(
+                      global,
+                      pps::compatibility_level::full,
+                      pps::write_source::schema_registry_sync)
+                    .get());
+
+    require_readonly(
+      seq.local().delete_config(global, pps::write_source::client));
+    BOOST_REQUIRE(
+      seq.local()
+        .delete_config(global, pps::write_source::schema_registry_sync)
+        .get());
+
+    require_readonly(seq.local().delete_subject_impermanent(
+      subject1, pps::write_source::client));
+    auto soft_deleted = seq.local()
+                          .delete_subject_impermanent(
+                            subject1, pps::write_source::schema_registry_sync)
+                          .get();
+    BOOST_REQUIRE_EQUAL(soft_deleted.size(), 1);
+
+    require_readonly(seq.local().delete_subject_version(
+      subject0, version1, pps::write_source::client));
+    BOOST_REQUIRE(
+      seq.local()
+        .delete_subject_version(
+          subject0, version1, pps::write_source::schema_registry_sync)
+        .get());
+
+    require_readonly(seq.local().delete_subject_permanent(
+      subject0, version1, pps::write_source::client));
+    auto deleted = seq.local()
+                     .delete_subject_permanent(
+                       subject0,
+                       version1,
+                       pps::write_source::schema_registry_sync)
+                     .get();
+    BOOST_REQUIRE_EQUAL(deleted.size(), 1);
+    BOOST_REQUIRE_EQUAL(deleted.front(), version1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_imported_write_keys_carry_subject) {
+    pps::sharded_store s;
+    s.start(pps::is_mutable::yes, ss::default_smp_service_group()).get();
+    auto stop_store = ss::defer([&s]() { s.stop().get(); });
+
+    accepting_transport transport;
+
+    ss::sharded<pps::seq_writer> seq;
+    seq
+      .start(
+        model::node_id{0},
+        ss::default_smp_service_group(),
+        std::ref(transport),
+        std::reference_wrapper(s),
+        ss::sharded_parameter(
+          [] { return std::make_unique<sequence_state_checker_test>(); }))
+      .get();
+    auto stop_seq = ss::defer([&seq]() { seq.stop().get(); });
+
+    auto result = seq.local()
+                    .write_subject_version_imported(
+                      pps::stored_schema{
+                        .schema = {subject0, int_def0.share()},
+                        .version = version1,
+                        .id = id1,
+                        .deleted = pps::is_deleted::no})
+                    .get();
+    BOOST_REQUIRE_EQUAL(result.id, id1);
+
+    // Store apply reads the subject from the value; compaction uses the key.
+    BOOST_REQUIRE_EQUAL(transport.produced.size(), 1);
+    auto records = transport.produced.front().copy_records();
+    BOOST_REQUIRE(!records.empty());
+    iobuf_parser key_parser{records.back().key().copy()};
+    auto key = std::string{key_parser.read_string(key_parser.bytes_left())};
+    BOOST_REQUIRE(key.find("subject0") != std::string::npos);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_sync_writes_disabled) {
+    pps::sharded_store s;
+    s.start(pps::is_mutable::no, ss::default_smp_service_group()).get();
+    auto stop_store = ss::defer([&s]() { s.stop().get(); });
+
+    noop_transport dummy_transport;
+
+    ss::sharded<pps::seq_writer> seq;
+    seq
+      .start(
+        model::node_id{0},
+        ss::default_smp_service_group(),
+        std::ref(dummy_transport),
+        std::reference_wrapper(s),
+        ss::sharded_parameter([] {
+            return std::make_unique<sequence_state_checker_test>(
+              pps::sequence_state_checker::writes_disabled_t::yes,
+              pps::sequence_state_checker::writes_disabled_t::yes);
+        }))
+      .get();
+    auto stop_seq = ss::defer([&seq]() { seq.stop().get(); });
+
+    BOOST_REQUIRE_EXCEPTION(
+      seq.local()
+        .write_mode(
+          pps::context_subject{pps::default_context, pps::subject{""}},
+          pps::mode::read_only,
+          pps::force::no,
+          pps::write_source::schema_registry_sync)
+        .get(),
+      pps::exception,
+      [](pps::exception e) {
+          return e.code() == pps::error_code::writes_disabled;
+      });
+}

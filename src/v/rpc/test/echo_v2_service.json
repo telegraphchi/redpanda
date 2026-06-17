@@ -1,0 +1,14 @@
+{
+    "namespace": "echo_v2",
+    "service_name": "echo",
+    "includes": [
+        "rpc/test/rpc_gen_types.h"
+    ],
+    "methods": [
+        {
+            "name": "echo",
+            "input_type": "echo_req",
+            "output_type": "echo_resp"
+        }
+    ]
+}
