@@ -30,6 +30,7 @@ import (
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/debug"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/generate"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/group"
+	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/k8s"
 	plugincmd "github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/plugin"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/profile"
 	"github.com/redpanda-data/redpanda/src/go/rpk/pkg/cli/registry"
@@ -129,6 +130,7 @@ Use --print-tree to emit the full command tree as JSON.`,
 		cluster.NewCommand(fs, p),
 		container.NewCommand(fs, p),
 		connect.NewCommand(fs, p, osExec),
+		k8s.NewCommand(fs, p, osExec),
 		profile.NewCommand(fs, p),
 		debug.NewCommand(fs, p),
 		generate.NewCommand(fs, p),
